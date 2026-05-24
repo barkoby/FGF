@@ -1,0 +1,18 @@
+# Gemma 4 through the Google Vertex provider path.
+rodi_root: /data
+work: /outputs/gemma4_default
+scenarios:
+  - cmt_renamed
+fraction: 1.0
+seed: coding-fgf-dev10-v1
+embedding_provider: google
+embedding_model: text-embedding-005
+llm_provider: google
+llm_model: gemma-4-26b-a4b-it-maas
+google_project: ${GOOGLE_CLOUD_PROJECT}
+google_location: ${GOOGLE_CLOUD_LOCATION}
+google_credentials: ${GOOGLE_APPLICATION_CREDENTIALS}
+k: 16
+match_workers: 4
+codegen_self_consistency: 3
+db_loader: psql

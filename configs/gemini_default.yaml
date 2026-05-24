@@ -1,0 +1,28 @@
+# Gemini configuration used for provider comparison.
+rodi_root: /data
+work: /outputs/gemini_default
+scenarios:
+  - cmt_renamed
+fraction: 1.0
+seed: coding-fgf-dev10-v1
+embedding_provider: google
+embedding_model: text-embedding-005
+llm_provider: google
+llm_model: gemini-3.1-flash-lite
+google_project: ${GOOGLE_CLOUD_PROJECT}
+google_location: ${GOOGLE_CLOUD_LOCATION}
+google_credentials: ${GOOGLE_APPLICATION_CREDENTIALS}
+k: 16
+match_workers: 4
+codegen_self_consistency: 3
+db_loader: psql
+fol_batching: hybrid
+fol_repair_context: batched
+fol_batch_max_tokens: 8000
+fol_repair_max_issues_per_prompt: 4
+attribute_coverage_validation: true
+attribute_coverage_repair: true
+fewshot: generic
+fewshot_include_matching: true
+fewshot_include_fol: true
+fewshot_include_codegen: true

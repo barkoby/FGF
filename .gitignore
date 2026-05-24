@@ -1,0 +1,31 @@
+# Secrets and local configuration
+.env
+*.env
+.gcloud/
+*.key
+*.pem
+
+# Data and generated outputs
+data/
+outputs/
+work/
+*.ttl
+*.nt
+*.nq
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.cache/
+.venv/
+venv/
+
+# Notebooks and editor files
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

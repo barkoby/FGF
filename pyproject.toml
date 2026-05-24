@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coding-fgf"
+version = "0.1.0"
+description = "Clean-room FGF pipeline for the RODI benchmark"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "rdflib>=7.1.1",
+    "numpy>=1.26.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.1",
+    "PyYAML>=6.0.2",
+]
+
+[project.optional-dependencies]
+live = [
+    "openai>=1.99.0",
+    "google-auth>=2.29.0",
+    "faiss-cpu>=1.8.0",
+    "morph-kgc>=2.8.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.9",
+]
+dev = [
+    "pytest>=8.0",
+    "matplotlib>=3.8",
+]
+
+[project.scripts]
+coding-fgf = "coding_fgf.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["coding_fgf*"]
