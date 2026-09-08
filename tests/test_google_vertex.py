@@ -85,4 +85,4 @@ def test_google_embedding_live_mode_does_not_use_deterministic_fallback(
     )
     records = [{"id": "x", "text": "hello"}]
     with pytest.raises(RuntimeError, match="vertex unavailable"):
-        embed_records(records, tmp_path / "cache.jsonl", provider="google", model="text-embedding-005", offline=False)
+        embed_records(records, tmp_path / "cache.jsonl", provider="google", model="text-embedding-005", offline=False, google_project="test-project")

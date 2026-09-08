@@ -8,7 +8,7 @@ from typing import Any, Optional
 from rdflib import Graph, Literal, RDF, URIRef
 
 from .constants import SOURCE_BASE
-from .sandbox import run_generated_materializer
+from .sandbox import run_isolated_materializer
 from .schema import ForeignKey, SqlData, Table, key_tuple, table_key
 
 
@@ -317,10 +317,11 @@ def materialize_graph_with_log(
     code: str | None = None,
     raise_on_invalid: bool = True,
 ) -> tuple[Graph, dict[str, Any]]:
-    context = build_context(scenario, tables, data, fol)
-    if code:
-        triples = run_generated_materializer(code, context)
+    if code is not None:
+        triples, runtime_log = run_isolated_materializer(scenario, tables, data, fol, code)
     else:
+        context = build_context(scenario, tables, data, fol)
+        runtime_log = context["runtime_log"]
         triples = []
         for rule in context["rules"].get("class", []):
             for row in context["rows"].get(rule["source_table"], []):
@@ -339,7 +340,6 @@ def materialize_graph_with_log(
                     triples.append(triple)
 
     invalid = _invalid_triples(triples)
-    runtime_log = context["runtime_log"]
     runtime_log["generated_triples"] = len(triples)
     runtime_log["invalid_triples"] = invalid
     runtime_log["invalid_triple_count"] = len(invalid)
@@ -363,23 +363,25 @@ def materialize_to_file(
     code_path: Path | None = None,
     require_code: bool = True,
 ) -> Path:
-    fol = json.loads(fol_path.read_text(encoding="utf-8"))
-    if require_code and (code_path is None or not code_path.exists()):
-        raise FileNotFoundError("Generated code is required for RDF materialization; no deterministic materialization fallback is allowed")
-    code = code_path.read_text(encoding="utf-8") if code_path and code_path.exists() else None
     output_path.parent.mkdir(parents=True, exist_ok=True)
     log_path = output_path.with_suffix(".materialization_log.json")
+    output_path.unlink(missing_ok=True)
+    runtime_log = {}
     try:
+        fol = json.loads(fol_path.read_text(encoding="utf-8"))
+        if require_code and (code_path is None or not code_path.exists()):
+            raise FileNotFoundError("Generated code is required for RDF materialization; no deterministic materialization fallback is allowed")
+        code = code_path.read_text(encoding="utf-8") if code_path and code_path.exists() else None
         graph, runtime_log = materialize_graph_with_log(scenario, tables, data, fol, code=code, raise_on_invalid=False)
         log_path.write_text(json.dumps(runtime_log, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
         if int(runtime_log.get("invalid_triple_count", 0) or 0):
             raise ValueError(f"Generated materializer emitted {runtime_log['invalid_triple_count']} invalid RDF triple(s)")
         graph.serialize(destination=str(output_path), format="turtle")
     except Exception as exc:
-        if not log_path.exists():
-            log_path.write_text(
-                json.dumps({"scenario": scenario, "status": "error", "error": f"{type(exc).__name__}: {exc}"}, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+        runtime_log.update(scenario=scenario,
+            status=getattr(exc, "status", "invalid_triples" if runtime_log.get("invalid_triple_count") else "error"),
+            error=f"{type(exc).__name__}: {exc}")
+        log_path.write_text(json.dumps(runtime_log, indent=2, ensure_ascii=False), encoding="utf-8")
+        output_path.unlink(missing_ok=True)
         raise
     return output_path

@@ -6,6 +6,7 @@ import math
 import os
 import subprocess
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,7 +14,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from ..candidate_gold import load_scenario_data, normalize_uri, resolve_scenarios, scenario_dir
-from ..constants import FALLBACK_MATCH_MODEL, PAPER_SCENARIOS, REQUESTED_MATCH_MODEL
+from ..constants import PAPER_SCENARIOS, REQUESTED_MATCH_MODEL, DEFAULT_EMBEDDING_MODEL
+from ..providers import structured_generate, is_transient, status_code, RetryExhausted
+from ..candidate_methods import normalize_method
 from ..io import ensure_dir, read_jsonl, write_csv, write_json, write_jsonl
 from .matching_metrics import (
     aggregate_rows,
@@ -43,13 +46,14 @@ from .matching_prompts import (
 from .plot_matching_heatmaps import write_heatmaps
 
 
-DEFAULT_CANDIDATE_METHOD = "openai_small"
+DEFAULT_CANDIDATE_METHOD = "dense"
 DEFAULT_TOP_K = 16
 DEFAULT_OUTPUT_DIR = "outputs/matching_analysis"
 DEFAULT_CANDIDATE_ARTIFACT = "outputs/candidate_eval/candidates_by_method.jsonl"
 DEV10_PREFIX = "fgf_dev10_"
 
 RESULT_FIELDS = [
+    "llm_provider", "model_used", "models_used",
     "scenario",
     "method",
     "source_id",
@@ -132,82 +136,46 @@ class JsonCallResult:
     usage: Mapping[str, Any]
 
 
-class OpenAIJsonCaller:
-    def __init__(self, model: str, fallback_model: str, temperature: float, logger: Callable[[str, Any], None] | None = None) -> None:
-        self.model = model
-        self.fallback_model = fallback_model
-        self.temperature = temperature
-        self.logger = logger
+class ProviderJsonCaller:
+    def __init__(self, model, fallback_model="", temperature=0.0, logger=None, *,
+                 provider="openai", google_project="", google_location="", google_credentials=""):
+        self.model, self.fallback_model = model, fallback_model
+        self.temperature, self.logger, self.provider = temperature, logger, provider
+        self.google = dict(google_project=google_project, google_location=google_location,
+                           google_credentials=google_credentials)
 
-    def call(self, prompt: str, schema_name: str) -> JsonCallResult:
-        if not os.getenv("OPENAI_API_KEY"):
-            raise RuntimeError("OPENAI_API_KEY is not set")
-        from openai import OpenAI  # type: ignore
-
-        timeout_seconds = float(os.getenv("CODING_FGF_OPENAI_TIMEOUT_SECONDS", "90"))
-        rate_limit_retries = int(os.getenv("CODING_FGF_OPENAI_RATE_LIMIT_RETRIES", "8"))
-        rate_limit_backoff = float(os.getenv("CODING_FGF_OPENAI_RATE_LIMIT_BACKOFF_SECONDS", "30"))
-        client = OpenAI(timeout=timeout_seconds)
-        last_error: Exception | None = None
-        for model in dict.fromkeys((self.model, self.fallback_model)):
+    def call(self, prompt, schema_name):
+        models = [self.model] + ([self.fallback_model] if self.fallback_model and self.fallback_model != self.model else [])
+        for index, model in enumerate(models):
             try:
-                kwargs: dict[str, Any] = {
-                    "model": model,
-                    "input": prompt,
-                    "text": {"format": {"type": "json_object"}},
-                }
-                if self.temperature:
-                    kwargs["temperature"] = self.temperature
-                response = self._create_with_retries(client, kwargs, schema_name, model, rate_limit_retries, rate_limit_backoff)
-                text = getattr(response, "output_text", "")
-                if not text:
-                    text = response.output[0].content[0].text  # type: ignore[attr-defined]
-                usage = getattr(response, "usage", {}) or {}
-                if model != self.model and self.logger:
-                    self.logger("api:fallback_model", schema=schema_name, model=model)
-                return JsonCallResult(data=json.loads(text), model_used=model, usage=_usage_dict(usage))
+                result = structured_generate(prompt, schema_name, model, provider=self.provider,
+                    temperature=self.temperature, **self.google,
+                    event_logger=(lambda message: self.logger(message)) if self.logger else None)
+                return JsonCallResult(result.data, result.model_used, result.usage)
             except Exception as exc:
-                last_error = exc
-                if self.logger:
-                    self.logger("api:call_error", schema=schema_name, model=model, error=type(exc).__name__)
-                continue
-        raise RuntimeError(f"OpenAI call failed for {schema_name}: {last_error}")
-
-    def _create_with_retries(
-        self,
-        client: Any,
-        kwargs: dict[str, Any],
-        schema_name: str,
-        model: str,
-        rate_limit_retries: int,
-        rate_limit_backoff: float,
-    ) -> Any:
-        for attempt in range(rate_limit_retries + 1):
-            try:
-                try:
-                    return client.responses.create(**kwargs)
-                except Exception as exc:
-                    if self.temperature and type(exc).__name__ == "BadRequestError" and "temperature" in kwargs:
-                        if self.logger:
-                            self.logger("api:retry_without_temperature", schema=schema_name, model=model)
-                        kwargs.pop("temperature", None)
-                        return client.responses.create(**kwargs)
+                # An explicitly requested model fallback is only useful for an unavailable model.
+                if index + 1 == len(models) or not (status_code(exc) == 404 or type(exc).__name__ == "NotFoundError"):
                     raise
-            except Exception as exc:
-                if type(exc).__name__ == "RateLimitError" and attempt < rate_limit_retries:
-                    sleep_seconds = min(300.0, rate_limit_backoff * (attempt + 1))
-                    if self.logger:
-                        self.logger(
-                            "api:rate_limit_backoff",
-                            schema=schema_name,
-                            model=model,
-                            attempt=attempt + 1,
-                            sleep_seconds=sleep_seconds,
-                        )
-                    time.sleep(sleep_seconds)
-                    continue
-                raise
-        raise RuntimeError("unreachable")
+                if self.logger:
+                    self.logger("api:fallback_model", provider=self.provider, model=models[index + 1])
+        raise RuntimeError("No configured generation model")
+
+class OpenAIJsonCaller(ProviderJsonCaller):
+    """Compatibility adapter for existing OpenAI callers."""
+
+def make_caller(args, temperature):
+    provider = getattr(args, "llm_provider", "openai")
+    if provider == "openai":
+        return OpenAIJsonCaller(args.model, args.fallback_model, temperature, logger=log_progress)
+    return ProviderJsonCaller(args.model, args.fallback_model, temperature, logger=log_progress,
+        provider=provider, google_project=args.google_project, google_location=args.google_location,
+        google_credentials=args.google_credentials)
+
+def stamp_models(row, *results):
+    models = list(dict.fromkeys(result.model_used for result in results))
+    row["models_used"] = models
+    row["model_used"] = ",".join(models)
+    return row
 
 
 def run_candidate_matching(args: argparse.Namespace) -> dict[str, Any]:
@@ -233,6 +201,7 @@ def run_candidate_matching(args: argparse.Namespace) -> dict[str, Any]:
         scenarios,
         args.candidate_method,
         args.top_k,
+        args.embedding_provider, args.embedding_model,
     )
     results: list[dict[str, Any]] = []
     usage_totals: dict[str, int] = {}
@@ -292,7 +261,7 @@ def run_method(
         raw = run_chain_of_verification(rows, args, usage_totals)
     else:
         raise ValueError(f"Unsupported method {method}")
-    return [attach_gold_and_score(row, gold_by_source) for row in raw]
+    return [attach_gold_and_score({**row, "llm_provider": getattr(args, "llm_provider", "openai")}, gold_by_source) for row in raw]
 
 
 def run_single_prompt_method(
@@ -302,14 +271,14 @@ def run_single_prompt_method(
     usage_totals: dict[str, int],
 ) -> list[dict[str, Any]]:
     temperature = temperature_for_method(method, args)
-    caller = OpenAIJsonCaller(args.model, args.fallback_model, temperature, logger=log_progress)
+    caller = make_caller(args, temperature)
 
     def worker(row: dict[str, Any], worker_count: int) -> dict[str, Any]:
         started = time.perf_counter()
         prompt = match_cot_style_v1(row, args.top_k)
         result = caller.call(prompt, "match_cot")
         add_usage(usage_totals, result.usage)
-        out = validate_match_response(result.data, row, method)
+        out = stamp_models(validate_match_response(result.data, row, method), result)
         out["runtime_seconds"] = time.perf_counter() - started
         return out
 
@@ -325,7 +294,7 @@ def run_single_prompt_method(
 
 
 def run_self_consistency(rows: list[dict[str, Any]], args: argparse.Namespace, usage_totals: dict[str, int]) -> list[dict[str, Any]]:
-    caller = OpenAIJsonCaller(args.model, args.fallback_model, float(args.self_consistency_temperature), logger=log_progress)
+    caller = make_caller(args, float(args.self_consistency_temperature))
 
     def worker(row: dict[str, Any], worker_count: int) -> dict[str, Any]:
         started = time.perf_counter()
@@ -337,9 +306,12 @@ def run_self_consistency(rows: list[dict[str, Any]], args: argparse.Namespace, u
             result = caller.call(prompt, f"match_self_consistency_{sample_index + 1}")
             add_usage(usage_totals, result.usage)
             sample = validate_match_response(result.data, row, METHOD_SELF_CONSISTENCY, allowed_uris=allowed_uris)
+            stamp_models(sample, result)
             sample["sample_index"] = sample_index + 1
             samples.append(sample)
         out = aggregate_self_consistency(samples, row)
+        out["models_used"] = list(dict.fromkeys(m for sample in samples for m in sample["models_used"]))
+        out["model_used"] = ",".join(out["models_used"])
         out["runtime_seconds"] = time.perf_counter() - started
         return out
 
@@ -355,7 +327,7 @@ def run_self_consistency(rows: list[dict[str, Any]], args: argparse.Namespace, u
 
 
 def run_chain_of_verification(rows: list[dict[str, Any]], args: argparse.Namespace, usage_totals: dict[str, int]) -> list[dict[str, Any]]:
-    caller = OpenAIJsonCaller(args.model, args.fallback_model, temperature_for_method(METHOD_CHAIN_OF_VERIFICATION, args), logger=log_progress)
+    caller = make_caller(args, temperature_for_method(METHOD_CHAIN_OF_VERIFICATION, args))
 
     def worker(row: dict[str, Any], worker_count: int) -> dict[str, Any]:
         started = time.perf_counter()
@@ -365,12 +337,13 @@ def run_chain_of_verification(rows: list[dict[str, Any]], args: argparse.Namespa
         if not stage1_valid:
             out = invalid_result(row, METHOD_CHAIN_OF_VERIFICATION, "invalid_stage1", "Stage 1 shortlist was invalid")
             out["runtime_seconds"] = time.perf_counter() - started
+            stamp_models(out, stage1)
             out["stage1_shortlist"] = stage1_clean.get("shortlist", [])
             return out
         allowed = [item["target_uri"] for item in stage1_clean.get("shortlist", [])]
         stage2 = caller.call(match_cov_stage2_v1(row, stage1_clean, args.top_k), "match_cov_stage2")
         add_usage(usage_totals, stage2.usage)
-        out = validate_match_response(stage2.data, row, METHOD_CHAIN_OF_VERIFICATION, allowed_uris=allowed)
+        out = stamp_models(validate_match_response(stage2.data, row, METHOD_CHAIN_OF_VERIFICATION, allowed_uris=allowed), stage1, stage2)
         out["runtime_seconds"] = time.perf_counter() - started
         out["stage1_shortlist"] = stage1_clean.get("shortlist", [])
         out["stage1_reasons"] = {item["target_uri"]: item.get("reasons", []) for item in stage1_clean.get("shortlist", [])}
@@ -393,7 +366,7 @@ def run_chain_of_verification(rows: list[dict[str, Any]], args: argparse.Namespa
 
 
 def run_current_validated(rows: list[dict[str, Any]], args: argparse.Namespace, usage_totals: dict[str, int]) -> list[dict[str, Any]]:
-    caller = OpenAIJsonCaller(args.model, args.fallback_model, temperature_for_method(METHOD_CURRENT_VALIDATED, args), logger=log_progress)
+    caller = make_caller(args, temperature_for_method(METHOD_CURRENT_VALIDATED, args))
     indexed = list(enumerate(rows))
     results: list[dict[str, Any] | None] = [None] * len(rows)
     current_group_size = max(1, int(args.current_group_size))
@@ -405,12 +378,14 @@ def run_current_validated(rows: list[dict[str, Any]], args: argparse.Namespace, 
         result = caller.call(match_current_validated_table_v1(group_rows, args.top_k), "match_current_validated")
         add_usage(usage_totals, result.usage)
         by_source = _validated_by_source(result.data, group_rows, METHOD_CURRENT_VALIDATED)
+        for item in by_source.values():
+            stamp_models(item, result)
         out: dict[int, dict[str, Any]] = {}
         for index, row in group:
             source_id = str(row["source"]["id"])
             item = by_source.get(source_id)
             if item is None:
-                item = invalid_result(row, METHOD_CURRENT_VALIDATED, "missing_source_id", "LLM omitted this source or selected an invalid candidate")
+                item = stamp_models(invalid_result(row, METHOD_CURRENT_VALIDATED, "missing_source_id", "LLM omitted this source or selected an invalid candidate"), result)
             item["runtime_seconds"] = (time.perf_counter() - group_started) / max(1, len(group))
             item["initial_selected_target"] = item.get("predicted_target_uri")
             item["validation_result"] = "initial_valid" if not item.get("invalid_selection") else "initial_invalid"
@@ -441,6 +416,8 @@ def run_current_validated(rows: list[dict[str, Any]], args: argparse.Namespace, 
             result = caller.call(match_current_no_match_review_v1(group_rows, args.top_k), "match_current_review")
             add_usage(usage_totals, result.usage)
             by_source = _validated_by_source(result.data, group_rows, METHOD_CURRENT_VALIDATED)
+            for item in by_source.values():
+                stamp_models(item, result)
             out = {}
             for index, row in group:
                 candidate = by_source.get(str(row["source"]["id"]))
@@ -450,7 +427,7 @@ def run_current_validated(rows: list[dict[str, Any]], args: argparse.Namespace, 
                     out[index] = candidate
             return out
 
-        for group_result in adaptive_map(review_groups, review_worker, lambda group, error, attempts, workers: {}, args.max_workers, args.api_retries, log_progress, f"{rows[0].get('scenario', '')}:current_review"):
+        for group_result in adaptive_map(review_groups, review_worker, lambda group, error, attempts, workers: {index: _final_api_row(row, METHOD_CURRENT_VALIDATED, f"Review stage: {error}", attempts, workers) for index, row in group}, args.max_workers, args.api_retries, log_progress, f"{rows[0].get('scenario', '')}:current_review"):
             for index, result in group_result.items():
                 results[index] = result
 
@@ -466,6 +443,8 @@ def run_current_validated(rows: list[dict[str, Any]], args: argparse.Namespace, 
             result = caller.call(match_current_referee_v1(group_rows, prior, siblings, args.top_k), "match_current_referee")
             add_usage(usage_totals, result.usage)
             by_source = _validated_by_source(result.data, group_rows, METHOD_CURRENT_VALIDATED)
+            for item in by_source.values():
+                stamp_models(item, result)
             out = {}
             for index, row in group:
                 candidate = by_source.get(str(row["source"]["id"]))
@@ -475,7 +454,7 @@ def run_current_validated(rows: list[dict[str, Any]], args: argparse.Namespace, 
                     out[index] = candidate
             return out
 
-        for group_result in adaptive_map(referee_groups, referee_worker, lambda group, error, attempts, workers: {}, args.max_workers, args.api_retries, log_progress, f"{rows[0].get('scenario', '')}:current_referee"):
+        for group_result in adaptive_map(referee_groups, referee_worker, lambda group, error, attempts, workers: {index: _final_api_row(row, METHOD_CURRENT_VALIDATED, f"Referee stage: {error}", attempts, workers) for index, row in group}, args.max_workers, args.api_retries, log_progress, f"{rows[0].get('scenario', '')}:current_referee"):
             for index, result in group_result.items():
                 results[index] = result
 
@@ -487,100 +466,46 @@ def adaptive_map(
     worker: Callable[[Any, int], Any],
     api_error_builder: Callable[[Any, str, int, int], Any],
     max_workers: int = 4,
-    api_retries: int = 3,
+    api_retries: int = 2,
     logger: Callable[[str, Any], None] | None = None,
     context: str = "",
 ) -> list[Any]:
-    indexed_pending = list(enumerate(tasks))
-    output: list[Any | None] = [None] * len(tasks)
-    current_workers = max(1, int(max_workers or 1))
-    attempts = 0
-    same_worker_retry_used = False
-    last_error_by_index: dict[int, str] = {}
-    no_api_error_rows = _no_api_error_rows()
-    while indexed_pending:
-        attempts += 1
-        window = indexed_pending[:current_workers]
-        remaining = indexed_pending[current_workers:]
-        if logger:
-            logger(
-                "api:batch:start",
-                context=context,
-                attempt=attempts,
-                tasks=len(window),
-                pending_total=len(indexed_pending),
-                workers=current_workers,
-            )
-        errors: list[tuple[int, Any]] = []
-        with ThreadPoolExecutor(max_workers=current_workers) as executor:
-            future_to_item = {executor.submit(worker, task, current_workers): (index, task) for index, task in window}
-            for future in as_completed(future_to_item):
-                index, task = future_to_item[future]
+    if api_retries < 0:
+        raise ValueError("api_retries must be nonnegative")
+    pending = list(enumerate(tasks))
+    output = [None] * len(tasks)
+    attempts = {index: 0 for index, _ in pending}
+    workers = max(1, int(max_workers))
+    while pending:
+        window, remaining = pending[:workers], pending[workers:]
+        retry = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {}
+            for index, task in window:
+                attempts[index] += 1
+                futures[executor.submit(worker, task, workers)] = (index, task)
+            for future in as_completed(futures):
+                index, task = futures[future]
                 try:
                     output[index] = future.result()
                 except Exception as exc:
                     message = f"{type(exc).__name__}: {exc}"
-                    last_error_by_index[index] = message
-                    errors.append((index, task))
-                    if logger:
-                        logger("api:task_error", context=context, attempt=attempts, workers=current_workers, error=type(exc).__name__)
-        if not errors:
-            indexed_pending = remaining
-            continue
-        if no_api_error_rows:
-            blocking_errors = [
-                last_error_by_index.get(index, "API error")
-                for index, _ in errors
-                if _is_blocking_api_error(last_error_by_index.get(index, "API error"))
-            ]
-            if blocking_errors:
-                message = "; ".join(blocking_errors[:3])
-                if logger:
-                    logger("api:setup_failure", context=context, error=message)
-                raise RuntimeError(f"Blocking API configuration error in {context}: {message}")
-            indexed_pending = errors + remaining
-            next_workers = _next_worker_count(current_workers)
-            if next_workers < current_workers:
-                if logger:
-                    logger("api:workers_reduce", context=context, from_workers=current_workers, to_workers=next_workers, pending=len(indexed_pending))
-                current_workers = next_workers
-            else:
-                if logger:
-                    logger("api:serial_retry", context=context, workers=current_workers, pending=len(indexed_pending))
-            sleep_seconds = _api_backoff_seconds(attempts)
-            if sleep_seconds > 0:
-                if logger:
-                    logger("api:backoff", context=context, attempt=attempts, sleep_seconds=sleep_seconds)
-                time.sleep(sleep_seconds)
-            continue
-        if attempts > max(1, api_retries + 3):
-            for index, task in errors:
-                if logger:
-                    logger(
-                        "api:error_row",
-                        context=context,
-                        attempt=attempts,
-                        workers=current_workers,
-                        error=last_error_by_index.get(index, "API error"),
-                )
-                output[index] = api_error_builder(task, last_error_by_index.get(index, "API error"), attempts, current_workers)
-            indexed_pending = remaining
-            continue
-        indexed_pending = errors + remaining
-        if not same_worker_retry_used:
-            same_worker_retry_used = True
-            if logger:
-                logger("api:retry_same_workers", context=context, workers=current_workers, pending=len(indexed_pending))
-            continue
-        next_workers = _next_worker_count(current_workers)
-        if next_workers < current_workers:
-            if logger:
-                logger("api:workers_reduce", context=context, from_workers=current_workers, to_workers=next_workers, pending=len(indexed_pending))
-            current_workers = next_workers
-        else:
-            if logger:
-                logger("api:serial_retry", context=context, workers=current_workers, pending=len(indexed_pending))
-    return [item for item in output]
+                    if is_transient(exc) and attempts[index] <= api_retries:
+                        retry.append((index, task))
+                    elif _no_api_error_rows():
+                        raise RuntimeError(f"API task failed in {context} after {attempts[index]} attempts: {message}") from exc
+                    else:
+                        output[index] = api_error_builder(task, message, attempts[index], workers)
+                        if logger:
+                            logger("api:error_row", context=context, attempts=attempts[index], error=message)
+        if retry:
+            next_workers = _next_worker_count(workers)
+            if next_workers < workers and logger:
+                logger("api:workers_reduce", context=context, from_workers=workers, to_workers=next_workers)
+            workers = next_workers
+            time.sleep(_api_backoff_seconds(max(attempts[index] for index, _ in retry)))
+        pending = sorted(retry) + remaining
+    return output
 
 
 def load_candidate_artifact_rows(
@@ -589,11 +514,39 @@ def load_candidate_artifact_rows(
     scenarios: Sequence[str],
     candidate_method: str,
     top_k: int,
+    embedding_provider: str = "openai",
+    embedding_model: str | None = None,
 ) -> dict[str, tuple[list[dict[str, Any]], dict[str, tuple[str, ...]]]]:
     if not artifact_path.exists():
         raise FileNotFoundError(f"Candidate artifact not found: {artifact_path}")
     raw_rows = read_jsonl(artifact_path)
-    by_key = {(str(row.get("scenario")), str(row.get("method")), str(row.get("source_id"))): row for row in raw_rows}
+    legacy_config_path = artifact_path.with_name("method_configs.json")
+    legacy_config = {}
+    if any(row.get("method") == "openai_small" for row in raw_rows) and legacy_config_path.exists():
+        legacy_config = json.loads(legacy_config_path.read_text(encoding="utf-8"))
+        if not isinstance(legacy_config, dict):
+            raise ValueError("Legacy candidate model provenance must be an object in method_configs.json")
+    candidate_method = normalize_method(candidate_method, embedding_provider)
+    by_key = {}
+    for row in raw_rows:
+        method = str(row.get("method"))
+        row_provider = row.get("embedding_provider")
+        legacy = method == "openai_small" and row_provider is None
+        if legacy:
+            row_provider = legacy_config.get("embedding_provider", "openai")
+        normalized = normalize_method(method, row_provider or embedding_provider)
+        if normalized != candidate_method:
+            continue
+        if row_provider != embedding_provider:
+            raise ValueError("Candidate artifact embedding provider provenance is missing or incompatible")
+        row_model = row.get("embedding_model") or (legacy_config.get("embedding_model") if legacy else None)
+        if not row_model:
+            raise ValueError("Candidate artifact lacks embedding model provenance; keep method_configs.json beside legacy artifacts")
+        if embedding_model and row_model != embedding_model:
+            raise ValueError("Candidate artifact embedding model is incompatible")
+        if row.get("embedding_mode", "live" if legacy else None) != "live":
+            raise ValueError("Candidate artifact is not a provenance-complete live artifact")
+        by_key[(str(row.get("scenario")), normalized, str(row.get("source_id")))] = row
     out: dict[str, tuple[list[dict[str, Any]], dict[str, tuple[str, ...]]]] = {}
     for scenario in scenarios:
         artifact_scenario = base_scenario_for_artifact(scenario)
@@ -732,6 +685,7 @@ def write_outputs(
     write_json(
         output_dir / "method_configs.json",
         {
+            "llm_provider": args.llm_provider,
             "model": args.model,
             "fallback_model": args.fallback_model,
             "candidate_method": args.candidate_method,
@@ -753,8 +707,6 @@ def write_outputs(
             "use_warmed_embeddings": bool(args.use_warmed_embeddings),
             "dev10_scenarios": bool(args.dev10_scenarios),
             "no_api_error_rows": _no_api_error_rows(),
-            "candidate_audit_json_present": False,
-            "v3_reference_path": r"<legacy-local-repo>",
         },
     )
     log_progress("outputs:write:file", path=str(output_dir / "method_configs.json"), rows=1)
@@ -906,12 +858,15 @@ def temperature_for_method(method: str, args: argparse.Namespace) -> float:
     return float(args.temperature)
 
 
+_USAGE_LOCK = threading.Lock()
+
 def add_usage(usage_totals: dict[str, int], usage: Mapping[str, Any]) -> None:
-    for key, value in usage.items():
-        try:
-            usage_totals[key] = usage_totals.get(key, 0) + int(value)
-        except (TypeError, ValueError):
-            continue
+    with _USAGE_LOCK:
+        for key, value in usage.items():
+            try:
+                usage_totals[key] = usage_totals.get(key, 0) + int(value)
+            except (TypeError, ValueError):
+                continue
 
 
 def _usage_dict(usage: Any) -> dict[str, int]:
@@ -1037,14 +992,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-warmed-embeddings", action="store_true", default=True)
     parser.add_argument("--regenerate-candidates", action="store_true", help="Reserved; matching analysis does not regenerate candidates by default")
     parser.add_argument("--allow-embedding-api", action="store_true", help="Reserved; embeddings are not regenerated unless candidate regeneration is implemented")
+    parser.add_argument("--llm-provider", choices=["openai", "google"], default="openai")
+    parser.add_argument("--embedding-provider", choices=["openai", "google"], default="openai")
+    parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
+    parser.add_argument("--google-project", default="")
+    parser.add_argument("--google-location", default="")
+    parser.add_argument("--google-credentials", default="")
     parser.add_argument("--model", default=REQUESTED_MATCH_MODEL)
-    parser.add_argument("--fallback-model", default=FALLBACK_MATCH_MODEL)
+    parser.add_argument("--fallback-model", default="")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--self-consistency-temperature", type=float, default=0.4)
     parser.add_argument("--self-consistency-top-k", type=int, default=2)
     parser.add_argument("--current-group-size", type=int, default=12)
     parser.add_argument("--max-workers", type=int, default=4)
-    parser.add_argument("--api-retries", type=int, default=3)
+    parser.add_argument("--api-retries", type=int, default=2)
     parser.add_argument("--self-consistency-samples", type=int, default=5)
     parser.add_argument("--list-methods", action="store_true")
     parser.add_argument("--list-scenarios", action="store_true")

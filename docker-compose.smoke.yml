@@ -1,0 +1,28 @@
+services:
+  smoke-postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks: [smoke]
+  smoke:
+    build: .
+    image: fgf-release-smoke
+    depends_on:
+      smoke-postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: smoke-postgres
+      OPENAI_API_KEY: ""
+      OPENBLAS_NUM_THREADS: "1"
+      RUN_LIVE_OPENAI: "0"
+      RUN_LIVE_LLM: ""
+    command: ["python", "scripts/run_container_smoke.py"]
+    networks: [smoke]
+networks:
+  smoke:
+    internal: true

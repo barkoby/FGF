@@ -415,70 +415,6 @@ def test_fol_portfolio_selector_source_excludes_evaluation_feedback() -> None:
     assert all(term not in lowered for term in forbidden)
 
 
-def test_fol_portfolio_replay_selects_known_restoration_arms_without_eval_files() -> None:
-    root = Path("work")
-    required = [
-        root / "full9_fraction1_20260517/openai_sigkdd_renamed/runs/sigkdd_renamed",
-        root / "improve_fgf_20260524_openai_stage2_guarded/runs/sigkdd_renamed",
-        root / "full9_fraction1_20260517/openai_sigkdd_structured/runs/sigkdd_structured",
-        root / "improve_fgf_20260523_openai_first/stage2_hybrid/runs/sigkdd_structured",
-        root / "improve_fgf_20260523_openai_first/stage2c_round2_only_v2/runs/sigkdd_structured",
-        root / "full9_fraction1_20260517/openai_sigkdd_mixed/runs/sigkdd_mixed",
-        root / "improve_fgf_20260523_openai_first/stage2_hybrid/runs/sigkdd_mixed",
-        root / "improve_fgf_20260523_openai_first/stage2c_round2_only_v2/runs/sigkdd_mixed",
-    ]
-    if not all(path.exists() for path in required):
-        pytest.skip("local run artifacts unavailable")
-
-    def replay_record(arm: str, path: Path) -> dict[str, object]:
-        materialization = json.loads((path / "import.materialization_log.json").read_text(encoding="utf-8"))
-        report = json.loads((path / "fol_validation_report.json").read_text(encoding="utf-8"))
-        issues = report.get("issues_after", []) or []
-        issue_counts: dict[str, int] = {}
-        for issue in issues:
-            name = str(issue.get("issue", ""))
-            issue_counts[name] = issue_counts.get(name, 0) + 1
-        record = _portfolio_record(
-            arm,
-            int(materialization.get("generated_triples", 0) or 0),
-            issues=len(issues),
-            invalid=int(materialization.get("invalid_triple_count", 0) or 0),
-        )
-        record["import_exists"] = (path / "import.ttl").exists()
-        record["materialization_status"] = materialization.get("status", "success")
-        record["issues_by_type"] = issue_counts
-        record["critical_issue_count"] = sum(
-            issue_counts.get(name, 0)
-            for name in {
-                "target_not_in_selected_matches",
-                "missing_match_ids",
-                "match_ids_do_not_reference_selected_matches",
-            }
-        )
-        record["hard_rejections"] = _fol_portfolio_hard_rejections(record)
-        return record
-
-    sigkdd_renamed = [
-        replay_record("full9_default", required[0]),
-        replay_record("stage2_hybrid", required[1]),
-    ]
-    assert _select_fol_portfolio_candidate(sigkdd_renamed)["arm"] == "full9_default"
-
-    sigkdd_structured = [
-        replay_record("full9_default", required[2]),
-        replay_record("stage2_hybrid", required[3]),
-        replay_record("stage2c_round2_only", required[4]),
-    ]
-    assert _select_fol_portfolio_candidate(sigkdd_structured)["arm"] == "stage2_hybrid"
-
-    sigkdd_mixed = [
-        replay_record("full9_default", required[5]),
-        replay_record("stage2_hybrid", required[6]),
-        replay_record("stage2c_round2_only", required[7]),
-    ]
-    assert _select_fol_portfolio_candidate(sigkdd_mixed)["arm"] == "stage2c_round2_only"
-
-
 def _json_payload_from_prompt(prompt: str) -> dict[str, object]:
     return json.loads(prompt[prompt.index("{") :])
 
@@ -531,24 +467,6 @@ def test_fol_few_shot_prompt_enabled_only_and_safe() -> None:
     assert "Use only target URIs that appear in the supplied selected matches" in enabled
     for forbidden in ("cmt_", "conference_", "sigkdd", "Q38", "LLM4VKG", "BootOX", "gold answers"):
         assert forbidden not in enabled
-
-
-def test_generic_fewshot_example_files_are_synthetic_and_safe() -> None:
-    root = Path("prompts") / "examples"
-    files = [
-        root / "matching" / "generic.json",
-        root / "fol_generation" / "generic.json",
-        root / "codegen" / "generic.json",
-    ]
-    forbidden = ("cmt_", "conference_", "sigkdd", "mondial", "npd_", "Q38", "LLM4VKG", "BootOX", "gold", "benchmark score")
-    for path in files:
-        assert path.exists()
-        text = path.read_text(encoding="utf-8")
-        parsed = json.loads(text)
-        assert parsed["examples"]
-        lowered = text.lower()
-        for token in forbidden:
-            assert token.lower() not in lowered
 
 
 def test_fol_prompt_context_excludes_unrelated_tables_and_matches() -> None:

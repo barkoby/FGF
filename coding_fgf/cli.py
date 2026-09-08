@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import copy
@@ -19,6 +19,7 @@ from .attribute_coverage import (
 from .compare import compare_runs, compare_to_paper
 from .constants import DEFAULT_EMBEDDING_MODEL, PAPER_SCENARIOS, REQUESTED_CODE_MODEL, REQUESTED_MATCH_MODEL
 from .devset import create_devset
+from .fol_ablation import write_fol_ablation_report
 from .embeddings import embed_records
 from .evaluate import evaluate_graph, execute_sql_psycopg2
 from .fol import fol_validation_issues, mapping_diagnostics, matches_to_fol, validate_fol
@@ -82,7 +83,7 @@ def add_provider_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--llm-provider", choices=["openai", "google"], default=os.getenv("CODING_FGF_LLM_PROVIDER", "openai"))
     parser.add_argument("--llm-model", default=os.getenv("CODING_FGF_LLM_MODEL", ""))
     parser.add_argument("--embedding-provider", choices=["openai", "google"], default=os.getenv("CODING_FGF_EMBEDDING_PROVIDER", "openai"))
-    parser.add_argument("--google-project", default=os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GOOGLE_PROJECT") or "project_o")
+    parser.add_argument("--google-project", default=os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GOOGLE_PROJECT") or "")
     parser.add_argument("--google-location", default=os.getenv("GOOGLE_CLOUD_LOCATION") or os.getenv("GOOGLE_LOCATION") or "global")
     parser.add_argument("--google-credentials", default=os.getenv("GOOGLE_APPLICATION_CREDENTIALS", ""))
 
@@ -2186,7 +2187,7 @@ def _run_codegen_candidate(
             )
             execution_ok = int(runtime_log.get("invalid_triple_count", 0) or 0) == 0
         except Exception as exc:
-            runtime_log["status"] = "error"
+            runtime_log["status"] = getattr(exc, "status", "error")
             error = f"{type(exc).__name__}: {exc}"
     runtime_log["candidate_index"] = index
     runtime_log["static_ok"] = static_ok
@@ -2594,22 +2595,26 @@ def _generate_fol_portfolio_arm(
     _copy_frozen_upstream_artifacts(scenario_work, arm_work)
     write_json(arm_work / "matches.json", {"matches": matches})
     model = args.llm_model or REQUESTED_CODE_MODEL
-    raw_fol = llm_fol(
-        matches,
-        tables,
-        offline=offline,
-        provider=args.llm_provider,
-        model=model,
-        google_project=args.google_project,
-        google_location=args.google_location,
-        google_credentials=args.google_credentials,
-        object_link_evidence=None,
-        few_shot_examples=bool(settings["fol_few_shot_examples"]),
-        fol_batching=str(settings["fol_batching"]),
-        fol_batch_max_matches=getattr(args, "fol_batch_max_matches", None),
-        fol_batch_max_tokens=int(getattr(args, "fol_batch_max_tokens", 0)),
-        fol_batch_overlap_strategy=str(getattr(args, "fol_batch_overlap_strategy", "fk_neighbors")),
-    )
+    if offline:
+        raw_fol = matches_to_fol(matches, tables)
+        raw_fol["generation"] = {"source": "explicit_offline", "fol_portfolio_arm": arm}
+    else:
+        raw_fol = llm_fol(
+            matches,
+            tables,
+            offline=offline,
+            provider=args.llm_provider,
+            model=model,
+            google_project=args.google_project,
+            google_location=args.google_location,
+            google_credentials=args.google_credentials,
+            object_link_evidence=None,
+            few_shot_examples=bool(settings["fol_few_shot_examples"]),
+            fol_batching=str(settings["fol_batching"]),
+            fol_batch_max_matches=getattr(args, "fol_batch_max_matches", None),
+            fol_batch_max_tokens=int(getattr(args, "fol_batch_max_tokens", 0)),
+            fol_batch_overlap_strategy=str(getattr(args, "fol_batch_overlap_strategy", "fk_neighbors")),
+        )
     fol = validate_fol(raw_fol, tables)
     fol["generation"] = raw_fol.get(
         "generation",
@@ -2645,9 +2650,11 @@ def _generate_fol_portfolio_arm(
         "settings": settings,
         "issues_before": issues,
         "issues_after": issues,
-        "repair_attempted": bool(issues),
+        "repair_attempted": bool(issues) and not offline,
     }
-    if str(settings["fol_repair_mode"]) == "round2_only":
+    if offline:
+        repair_report["repair_skipped"] = "explicit_offline"
+    elif str(settings["fol_repair_mode"]) == "round2_only":
         fol, issues, single_summary = _run_fol_single_round2_style_repair(
             work=arm_work,
             fol=fol,
@@ -2884,103 +2891,71 @@ def _copy_selected_fol_portfolio_artifacts(selected_work: Path, scenario_work: P
         _copy_if_exists(selected_work / name, scenario_work / name)
 
 
-def _run_fol_portfolio(
-    *,
-    scenario: str,
-    dev_root: Path,
-    scenario_work: Path,
-    args: argparse.Namespace,
-    offline: bool,
-) -> dict[str, Any]:
+def _run_fol_portfolio(*, scenario, dev_root, scenario_work, args, offline):
     arms = _fol_portfolio_arms(args)
     if str(getattr(args, "fol_portfolio_selector", "internal_materialization")) != "internal_materialization":
         raise SystemExit("Only internal_materialization FOL portfolio selector is supported")
     matches, tables, data = _fol_portfolio_prepare_upstream(
-        scenario=scenario,
-        dev_root=dev_root,
-        scenario_work=scenario_work,
-        args=args,
-        offline=offline,
-    )
-    records: list[dict[str, Any]] = []
+        scenario=scenario, dev_root=dev_root, scenario_work=scenario_work, args=args, offline=offline)
+    records = []
     for arm in arms:
-        log_info(f"{scenario}: fol portfolio arm start arm={arm}")
-        arm_work, fol, issues, repair_report = _generate_fol_portfolio_arm(
-            scenario=scenario,
-            dev_root=dev_root,
-            scenario_work=scenario_work,
-            arm=arm,
-            matches=matches,
-            tables=tables,
-            data=data,
-            args=args,
-            offline=offline,
-        )
-        output = arm_work / "import.ttl"
-        arm_args = argparse.Namespace(**vars(args))
-        settings = _fol_portfolio_arm_settings(arm)
-        arm_args.fol_repair_mode = settings["fol_repair_mode"]
-        arm_args.fewshot = "none"
-        arm_args.codegen_few_shot_examples = False
+        arm_work = scenario_work / "fol_portfolio" / arm
         try:
+            arm_work, fol, issues, repair_report = _generate_fol_portfolio_arm(
+                scenario=scenario, dev_root=dev_root, scenario_work=scenario_work, arm=arm,
+                matches=matches, tables=tables, data=data, args=args, offline=offline)
+            arm_args = argparse.Namespace(**vars(args))
+            arm_args.fol_repair_mode = _fol_portfolio_arm_settings(arm)["fol_repair_mode"]
+            arm_args.fewshot = "none"
+            arm_args.codegen_few_shot_examples = False
             runtime_fallback = _codegen_and_materialize_with_round2_only_fallback(
-                scenario=scenario,
-                scenario_work=arm_work,
-                tables=tables,
-                data=data,
-                args=arm_args,
-                offline=offline,
-                output=output,
-            )
-            codegen_error = ""
+                scenario=scenario, scenario_work=arm_work, tables=tables, data=data,
+                args=arm_args, offline=offline, output=arm_work / "import.ttl")
+            final_fol = read_json(arm_work / "fol.json")
+            record = _fol_portfolio_record(
+                scenario=scenario, arm=arm, arm_work=arm_work, fol=final_fol,
+                issues=fol_validation_issues(final_fol, matches, tables),
+                matches=matches, tables=tables, data=data)
+            record["repair_report"] = {k: v for k, v in repair_report.items()
+                                       if k not in {"repair_response", "repair_round2_response"}}
+            record["runtime_fallback"] = runtime_fallback
         except Exception as exc:
-            runtime_fallback = {}
-            codegen_error = f"{type(exc).__name__}: {exc}"
-        record = _fol_portfolio_record(
-            scenario=scenario,
-            arm=arm,
-            arm_work=arm_work,
-            fol=read_json(arm_work / "fol.json") if (arm_work / "fol.json").exists() else fol,
-            issues=fol_validation_issues(read_json(arm_work / "fol.json"), matches, tables) if (arm_work / "fol.json").exists() else issues,
-            matches=matches,
-            tables=tables,
-            data=data,
-        )
-        record["repair_report"] = {k: v for k, v in repair_report.items() if k not in {"repair_response", "repair_round2_response"}}
-        record["runtime_fallback"] = runtime_fallback
-        record["codegen_error"] = codegen_error
+            record = {"scenario": scenario, "arm": arm, "work": str(arm_work),
+                      "codegen_error": f"{type(exc).__name__}: {exc}",
+                      "materialization_status": getattr(exc, "status", "error"),
+                      "import_exists": False}
         record["hard_rejections"] = _fol_portfolio_hard_rejections(record)
+        ensure_dir(arm_work)
         write_json(arm_work / "fol_portfolio_candidate_report.json", record)
         records.append(record)
-        log_info(
-            f"{scenario}: fol portfolio arm complete arm={arm} generated={record.get('generated_triples')} "
-            f"invalid={record.get('invalid_triples')} hard_rejections={record.get('hard_rejections')}"
-        )
-    selected = _select_fol_portfolio_candidate(records)
-    selected_work = Path(str(selected["work"]))
-    _copy_selected_fol_portfolio_artifacts(selected_work, scenario_work)
-    selection_report = {
-        "selector": "internal_materialization",
-        "academic_safety": {
-            "forbidden_inputs": list(FOL_PORTFOLIO_FORBIDDEN_SELECTION_INPUTS),
-            "uses_qpair_or_gold_feedback": False,
-        },
-        "selected_arm": selected["arm"],
-        "selected_score": selected.get("selector_score", []),
-        "candidates": records,
-    }
     write_json(scenario_work / "fol_portfolio_candidate_report.json", {"candidates": records})
-    write_json(scenario_work / "fol_portfolio_selection_report.json", selection_report)
-    write_json(
-        scenario_work / "selected_fol_arm.json",
-        {
-            "selected_arm": selected["arm"],
-            "selected_work": str(selected_work),
-            "selector_score": selected.get("selector_score", []),
-        },
-    )
-    log_info(f"{scenario}: fol portfolio selected arm={selected['arm']} score={selected.get('selector_score')}")
-    return selection_report
+    try:
+        selected = _select_fol_portfolio_candidate(records)
+    except RuntimeError:
+        if getattr(args, "fol_ablation_report", False):
+            write_fol_ablation_report(scenario, records, None, None, None, scenario_work / "fol_ablation")
+        raise
+    selected_work = Path(selected["work"])
+    _copy_selected_fol_portfolio_artifacts(selected_work, scenario_work)
+    report = {"selector": "internal_materialization",
+              "academic_safety": {"forbidden_inputs": list(FOL_PORTFOLIO_FORBIDDEN_SELECTION_INPUTS),
+                                  "uses_qpair_or_gold_feedback": False},
+              "selected_arm": selected["arm"], "selected_score": selected.get("selector_score", []),
+              "candidates": records}
+    write_json(scenario_work / "fol_portfolio_candidate_report.json", {"candidates": records})
+    write_json(scenario_work / "fol_portfolio_selection_report.json", report)
+    write_json(scenario_work / "selected_fol_arm.json",
+               {"selected_arm": selected["arm"], "selected_work": str(selected_work),
+                "selector_score": selected.get("selector_score", [])})
+    # This boundary is deliberately after the immutable selection decision is persisted.
+    if getattr(args, "fol_ablation_report", False):
+        def sql_exec(sql):
+            return execute_sql_psycopg2(sql, dbname=scenario, host=args.db_host,
+                port=args.db_port, user=args.db_user, password=args.db_password)
+        write_fol_ablation_report(scenario, records, selected["arm"],
+            scenario_dir(dev_root, scenario) / "queries",
+            None if args.dry_run_db else sql_exec, scenario_work / "fol_ablation")
+    return report
 
 
 def _run_materialization_coverage_stage(
@@ -3565,7 +3540,7 @@ def cmd_run_one_benchmark(args: argparse.Namespace) -> None:
             llm_provider=getattr(args, "llm_provider", "openai"),
             llm_model=getattr(args, "llm_model", ""),
             embedding_provider=getattr(args, "embedding_provider", "openai"),
-            google_project=getattr(args, "google_project", "project_o"),
+            google_project=getattr(args, "google_project", ""),
             google_location=getattr(args, "google_location", "global"),
             google_credentials=getattr(args, "google_credentials", ""),
             allow_forced_candidates=getattr(args, "allow_forced_candidates", False),
@@ -3646,7 +3621,7 @@ def cmd_run_one_benchmark(args: argparse.Namespace) -> None:
             llm_provider=getattr(args, "llm_provider", "openai"),
             llm_model=getattr(args, "llm_model", ""),
             embedding_provider=getattr(args, "embedding_provider", "openai"),
-            google_project=getattr(args, "google_project", "project_o"),
+            google_project=getattr(args, "google_project", ""),
             google_location=getattr(args, "google_location", "global"),
             google_credentials=getattr(args, "google_credentials", ""),
             allow_forced_candidates=getattr(args, "allow_forced_candidates", False),
@@ -4095,6 +4070,8 @@ def cmd_run_fol_repair_ablation(args: argparse.Namespace) -> None:
 
 
 def cmd_run_paper_compare(args: argparse.Namespace) -> None:
+    if getattr(args, "fol_ablation_report", False) and not _fol_portfolio_enabled(args):
+        raise SystemExit("--fol-ablation-report requires --fol-portfolio")
     work = ensure_dir(Path(args.work))
     _write_leakage_risk_report(work)
     scenarios = _split_scenarios(args.scenarios)
@@ -4620,6 +4597,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_materialization_coverage_args(paper)
     add_pattern_first_args(paper)
     add_fol_portfolio_args(paper)
+    paper.add_argument("--fol-ablation-report", action="store_true")
     paper.add_argument("--dry-run-db", action="store_true")
     paper.add_argument("--db-loader", choices=["psql", "docker-compose"], default=os.getenv("CODING_FGF_DB_LOADER", "psql"))
     paper.add_argument("--compose-root", default="")

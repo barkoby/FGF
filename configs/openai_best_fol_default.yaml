@@ -1,4 +1,4 @@
-# Default reproducible configuration for the paper release.
+# Default OpenAI configuration for the public release.
 # Uses GPT/OpenAI with the academic-safe FOL portfolio selector.
 rodi_root: /data
 work: /outputs/openai_best_fol_default

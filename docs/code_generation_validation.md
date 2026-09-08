@@ -101,3 +101,7 @@ After candidate selection and optional repair, the chosen program is saved as th
 The materializer returns triples as subject-predicate-object tuples. Literal values are represented with a literal marker and converted into RDF literals during graph construction; other objects are interpreted as URI references. The resulting graph is serialized as the generated RDF output.
 
 When generated code is required, deterministic materialization fallback is disallowed. This ensures that the final RDF graph is produced by executing the selected generated program.
+
+## Worker isolation
+
+Generated materializers execute in spawned Linux workers with wall-clock and address-space limits. Helpers are reconstructed in the worker. Triples and complete runtime diagnostics return to the parent. Limit failures reject candidates without partial RDF or deterministic replacement. These controls are not a general-purpose hostile-code isolation boundary.

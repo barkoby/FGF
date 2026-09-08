@@ -1,6 +1,6 @@
 # Current FGF / RODI Architecture
 
-This document summarizes the current FGF / RODI benchmark architecture in general terms. It is intended as grounding for future prompts, experiments, and paper-method descriptions. It describes the executable v4-style pipeline and the current OpenAI/GPT, Google Gemini, and Google Vertex Gemma model configurations without recording run-specific results.
+This document describes the FGF pipeline for the RODI benchmark, including its OpenAI, Google Gemini, and Google Vertex Gemma configurations. It explains the processing stages, validation, and evaluation boundaries.
 
 ## Architectural Goal
 
@@ -28,11 +28,11 @@ The runner prepares one or more RODI scenarios from the source benchmark directo
 
 ### 2. Verbalization
 
-The pipeline converts relational and ontology structures into textual records used by retrieval and prompting. Source records represent SQL tables, columns, foreign-key relations, discriminator-like structures, and optional source-context variants. Target records represent ontology classes, data properties, and object properties. These verbalizations preserve the current v4 source and target record style so downstream stages can share the same identifiers and context fields.
+The pipeline converts relational and ontology structures into textual records used by retrieval and prompting. Source records represent SQL tables, columns, foreign-key relations, discriminator-like structures, and optional source-context variants. Target records represent ontology classes, data properties, and object properties. Downstream stages share the same source and target record identifiers and context fields.
 
 ### 3. Candidate Generation
 
-Candidate generation embeds source and target verbalizations with the selected embedding provider. The current architecture supports both OpenAI and Google Vertex embedding models. Embeddings are cached by provider, model, and text-derived keys. Retrieval uses vector similarity to produce a bounded top-k candidate list for each source element, normally with k set to 16 for matching.
+Candidate generation embeds source and target verbalizations with the selected embedding provider. The current architecture supports both OpenAI and Google Vertex embedding models. Embeddings are cached by provider, model, and text-derived keys. Pipeline retrieval ranks squared L2 distance with a lexical-overlap bonus, filters by source kind, and skips class retrieval for join tables. The default k is 16. Candidate ablations separately compare dense cosine similarity, lexical methods, and reciprocal-rank fusion.
 
 Candidate outputs are saved as diagnostic artifacts. Candidate metrics can be evaluated separately when gold target alignments are available, but final pipeline scoring is still based on generated RDF and query-pair evaluation.
 
@@ -62,7 +62,7 @@ This stage is mandatory: final benchmark results are valid only when they come f
 
 ### 8. Query-Pair Evaluation
 
-The evaluation stage uses the official RODI SQL-vs-SPARQL query-pair protocol. For each query pair, the SQL query is run against the original relational database, and the SPARQL query is run against the generated RDF graph. Precision, recall, and F1 are computed from the result-set comparison. Scenario-level and comparison reports are generated from these query-pair scores.
+The evaluation stage uses RODI SQL/SPARQL query pairs with the comparison conventions documented in evaluation.md. For each query pair, the SQL query is run against the original relational database, and the SPARQL query is run against the generated RDF graph. Precision, recall, and F1 are computed from the result-set comparison. Scenario-level and comparison reports are generated from these query-pair scores.
 
 ## Model Stack Architecture
 
@@ -74,7 +74,7 @@ The OpenAI suite uses the OpenAI provider for generation and OpenAI embeddings f
 
 ### Google Gemini Suite
 
-The Gemini suite uses Google Vertex AI as the provider path. Generation calls are sent to `gemini-3.1-flash-lite`, and candidate embeddings use `text-embedding-005`. Authentication uses Google Application Default Credentials, with project and location supplied through configuration. The current default project/location pattern is `project_o` and `global`, but these are configuration values rather than method logic.
+The Gemini suite uses Google Vertex AI as the provider path. Generation calls are sent to `gemini-3.1-flash-lite`, and candidate embeddings use `text-embedding-005`. Authentication uses Google Application Default Credentials, with project and location supplied through configuration. The project must be configured by the user; the default location is global.
 
 ### Google Vertex Gemma Suite
 
@@ -117,3 +117,7 @@ These artifacts make it possible to analyze candidate retrieval, matching, rule 
 
 The current solution is an executable LLM-assisted FGF pipeline for relational-to-RDF mapping. It uses embeddings to propose ontology candidates, LLMs to choose matches and synthesize rules, LLM-generated Python to implement the mapping, and an RDF materialization step to create the final graph. The same pipeline logic is used across OpenAI/GPT, Google Gemini, and Google Vertex Gemma configurations by swapping provider and model parameters rather than changing the benchmark method.
 
+
+## FOL portfolio ordering
+
+Each arm generates FOL, generates Python code, and materializes RDF before selection. The selector uses internal diagnostics and persists its decision. Query-pair evaluation, including the optional arm comparison, happens afterward.

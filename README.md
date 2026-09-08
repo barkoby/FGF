@@ -1,230 +1,111 @@
 # From Ontology Alignments to Executable Code: Automating Data Integration with Fact Generating Functions
 
-This repository contains the research implementation for the paper **"From Ontology Alignments to Executable Code: Automating Data Integration with Fact Generating Functions"**.
+Research implementation for **“From Ontology Alignments to Executable Code: Automating Data Integration with Fact Generating Functions.”**
 
-Fact Generating Functions (FGFs) are executable triple-conversion functions that transform facts expressed under source semantics into equivalent facts under target semantics. FGFs bridge ontology alignment and RDF materialization by making the transformation executable. This repository provides an end-to-end pipeline for transforming relational data into RDF under a target ontology and evaluating the generated graph with SQL--SPARQL query pairs when those benchmark queries are available.
+Fact Generating Functions (FGFs) transform source facts into target RDF facts. The pipeline retrieves ontology candidates, selects matches, validates mapping rules, generates Python materializers, and evaluates their RDF using SQL–SPARQL query pairs.
 
-## Overview
+## Supported workflow
 
-The pipeline prepares RODI scenarios, verbalizes relational schemas and ontologies, retrieves candidate ontology correspondences, selects matches with an LLM, generates and validates FOL-style mapping rules, selects the best FOL method with a gold-blind portfolio selector, generates executable Python FGF code, materializes RDF in a sandbox, and optionally evaluates generated RDF with SQL--SPARQL query-pair evaluation.
+Use Docker with Docker Compose on Linux, or Docker Desktop with Linux containers. The image supplies Python and dependencies. Generated code requires Linux process resource controls; run it inside the image.
 
-The default reproducible configuration uses the best-FOL-method selection setup. It runs a portfolio of FOL-generation methods and selects a candidate using internal materialization diagnostics before downstream code generation/evaluation.
+- `coding_fgf/`: pipeline, providers, materialization, evaluation
+- `configs/`: OpenAI, Gemini, and Gemma configurations
+- `scripts/`: pipeline, ablation, failure-analysis, and smoke commands
+- `tests/`: offline unit and regression tests
+- `docs/`: method, evaluation, and artifact documentation
 
-## Repository Structure
+## Quick start
 
-```text
-coding_fgf/      Core Python package and CLI
-configs/         Reproducible provider/configuration YAML files
-scripts/         Docker-oriented wrapper commands for runs and ablations
-tests/           Unit and regression tests
-docs/            High-level method documentation
-prompts/         Prompt examples/templates for paper artifacts
-Dockerfile       Docker image definition
-docker-compose.yml  Optional Docker Compose workflow
-.env.example     Environment-variable template with placeholders only
-```
-
-## Requirements
-
-The intended installation path is Docker-first. The host machine only needs Docker. Python dependencies are installed inside the image.
-
-## Data Setup
-
-Download the RODI benchmark from:
-
-<https://github.com/chrpin/rodi/tree/master>
-
-Mount the local RODI checkout into the container at `/data`. A typical layout is:
-
-```text
-/local/path/to/rodi/
-  data/
-  queries/
-  ...
-/local/path/to/fgf-outputs/
-```
-
-Inside Docker, the pipeline expects:
-
-```text
-/data      RODI benchmark checkout
-/outputs   generated run artifacts, RDF, diagnostics, and evaluation results
-```
-
-## Environment Variables
-
-Copy `.env.example` to `.env` and fill only the credentials you need locally. Do not commit `.env`.
-
-Important variables:
-
-```text
-OPENAI_API_KEY=
-GOOGLE_APPLICATION_CREDENTIALS=
-GOOGLE_CLOUD_PROJECT=
-GOOGLE_CLOUD_LOCATION=global
-RODI_DIR=/local/path/to/rodi
-OUTPUT_DIR=/local/path/to/outputs
-```
-
-## Docker-Based Installation
-
-Build the image:
-
-```bash
-docker build -t fgf-pipeline .
-```
-
-Run help:
-
-```bash
-docker run --rm fgf-pipeline python -m coding_fgf --help
-```
-
-With Compose:
+1. Obtain the [RODI benchmark](https://github.com/chrpin/rodi).
+2. Copy `.env.example` to `.env`. Set `RODI_DIR` to the host directory containing the benchmark's `data/` directory, and `OUTPUT_DIR` to a host output directory. Supply `OPENAI_API_KEY` for the default live configuration.
+3. Build and run:
 
 ```bash
 docker compose build fgf-pipeline
+docker compose run --rm fgf-pipeline \
+  python scripts/run_pipeline.py \
+  --config configs/openai_best_fol_default.yaml --scenario cmt_renamed
 ```
 
-## Default Configuration
+Compose starts PostgreSQL and waits for its health check. The application connects to `postgres:5432`. A standalone application container needs an explicitly configured database connection.
 
-The default release configuration is `configs/openai_best_fol_default.yaml`. It uses:
+The loader **drops and recreates databases named after the selected scenarios**. Use the dedicated Compose PostgreSQL service, not a database server holding other work. PostgreSQL is not published on a host port.
 
-- LLM provider: `openai`
-- LLM model: `gpt-5.4-nano`
-- embedding provider: `openai`
-- embedding model: `text-embedding-3-small`
-- FOL portfolio: enabled
-- FOL portfolio arms: `full9_default`, `stage2_hybrid`, `stage2c_round2_only`
-- selector: `internal_materialization`
-- candidate retrieval `k`: `16`
-- code-generation self-consistency: `3`
-- random seed: `coding-fgf-dev10-v1`
+The benchmark is mounted read-only at `/data`; the host output directory is mounted at `/outputs`. Default outputs appear under `/outputs/openai_best_fol_default`. See [artifact locations](docs/artifacts.md).
 
-Selection is gold-blind: SQL/SPARQL answers, gold mappings, paper scores, and query-pair failures are not used to select the FOL candidate.
-
-## Run the Full Pipeline
+For help and a configuration-only check:
 
 ```bash
-docker run --rm \
-  --env-file .env \
-  -v /local/path/to/rodi:/data:ro \
-  -v /local/path/to/outputs:/outputs \
-  fgf-pipeline \
-  python scripts/run_pipeline.py --config configs/openai_best_fol_default.yaml --scenario cmt_renamed
+docker compose run --rm --no-deps fgf-pipeline python -m coding_fgf --help
+docker compose run --rm --no-deps fgf-pipeline python scripts/run_smoke_test.py
 ```
 
-Run all nine paper scenarios by editing the `scenarios` list in the config or passing a comma-separated override:
+## Providers and settings
+
+- OpenAI: `configs/openai_best_fol_default.yaml`
+- Gemini: `configs/gemini_default.yaml`
+- Vertex Gemma: `configs/gemma4_default.yaml`
+
+For Google, set `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION` in `.env`. Set `GOOGLE_GCLOUD_CONFIG_DIR` to the **host** directory containing Google Application Default Credentials. Set `GOOGLE_APPLICATION_CREDENTIALS` to the **container** path, normally `/gcloud/application_default_credentials.json`. No personal project is assumed.
 
 ```bash
-docker run --rm --env-file .env \
-  -v /local/path/to/rodi:/data:ro \
-  -v /local/path/to/outputs:/outputs \
-  fgf-pipeline \
-  python scripts/run_pipeline.py --config configs/openai_best_fol_default.yaml \
-  --scenario cmt_renamed,conference_renamed,sigkdd_renamed,cmt_structured,conference_structured,sigkdd_structured,sigkdd_mixed,conference_nofks,cmt_denormalized
+docker compose run --rm fgf-pipeline python scripts/run_pipeline.py \
+  --config configs/gemini_default.yaml --scenario cmt_renamed
 ```
 
-## Provider Selection
+For Gemma, substitute its config. Provider/model access must be available in your account.
 
-### GPT/OpenAI
+YAML controls models, candidate count `k`, workers, code-generation candidates, scenarios, and FOL features. Extra wrapper arguments override generated CLI arguments. Live runs never substitute deterministic embeddings. Explicit `--offline` mode is for fixture tests and demonstrations.
+
+## Ablations
+
+All three configurations support candidate generation, matching, and FOL selection:
 
 ```bash
-docker run --rm --env-file .env \
-  -v /local/path/to/rodi:/data:ro \
-  -v /local/path/to/outputs:/outputs \
-  fgf-pipeline \
-  python scripts/run_pipeline.py --config configs/openai_best_fol_default.yaml --scenario cmt_renamed
+docker compose run --rm fgf-pipeline python scripts/run_ablation_candidate_generation.py \
+  --config configs/openai_best_fol_default.yaml
+docker compose run --rm fgf-pipeline python scripts/run_ablation_matching.py \
+  --config configs/openai_best_fol_default.yaml
+docker compose run --rm fgf-pipeline python scripts/run_ablation_fol_selection.py \
+  --config configs/openai_best_fol_default.yaml
 ```
 
-### Gemini
+Substitute the Gemini or Gemma config as needed. Run candidate generation before matching. Outputs are separated beneath the config's work directory in `ablations/candidate_generation`, `ablations/matching`, and `ablations/fol_selection`. Matching locates the corresponding candidate artifact automatically. Explicit `--candidate-artifact` and `--output-dir` override these defaults. `--dry-run` prints commands without provider calls.
+
+`dense` is the provider-independent retrieval method; `openai_small` is an OpenAI-only legacy alias. Artifacts identify the embedding provider/model, and incompatible inputs are rejected. Keep `method_configs.json` beside legacy artifacts so their actual embedding model can be checked.
+
+FOL selection generates each arm once and fixes the choice using internal diagnostics. Only afterward does the ablation evaluate each arm's saved RDF. The comparison retains failed arms and adds a `portfolio_selected` row with the selected arm's metrics. Evaluation cannot change selection. Later refinements have a separate final evaluation.
+
+## Failure analysis
+
+Read the pipeline's actual evaluation JSON:
 
 ```bash
-docker run --rm --env-file .env \
-  -v /local/path/to/rodi:/data:ro \
-  -v /local/path/to/outputs:/outputs \
-  -v /local/path/to/gcloud:/gcloud:ro \
-  fgf-pipeline \
-  python scripts/run_pipeline.py --config configs/gemini_default.yaml --scenario cmt_renamed
+docker compose run --rm --no-deps fgf-pipeline python scripts/run_failure_analysis.py \
+  --metrics /outputs/openai_best_fol_default/runs/cmt_renamed/eval/metrics_details.json \
+  --output /outputs/failure_modes_summary.csv
 ```
 
-### Gemma 4 via Google Vertex
+Successful queries are excluded. Labels are diagnostic heuristics, not proven causes. CSV input requires `precision`, `recall`, `sql_count`, `sparql_count`, and `categories` (or legacy `category`). Supply `scenario` in CSV rows or pass `--scenario`. For JSON outside its canonical scenario directory, pass `--scenario`.
 
-```bash
-docker run --rm --env-file .env \
-  -v /local/path/to/rodi:/data:ro \
-  -v /local/path/to/outputs:/outputs \
-  -v /local/path/to/gcloud:/gcloud:ro \
-  fgf-pipeline \
-  python scripts/run_pipeline.py --config configs/gemma4_default.yaml --scenario cmt_renamed
-```
+## Failure and execution limits
 
-## Main Hyperparameters
+Transient provider failures receive three total request attempts by default; permanent configuration errors fail immediately. `CODING_FGF_API_MAX_ATTEMPTS` must be positive. Malformed output has a separate bounded `CODING_FGF_MODEL_OUTPUT_MAX_ATTEMPTS` limit (default six). Matching has no implicit model fallback; an explicitly configured fallback stays within the selected provider and is recorded.
 
-The main reproducibility parameters live in `configs/*.yaml`:
+Embedding cache version 2 separates provider, model, live/offline mode, and verbalization version. Legacy entries remain on disk but are not reused automatically; the next live run may make new embedding requests.
 
-- `llm_provider`, `llm_model`
-- `embedding_provider`, `embedding_model`
-- `fol_portfolio`, `fol_portfolio_arms`, `fol_portfolio_selector`
-- `k`, `match_workers`, `codegen_self_consistency`
-- `fraction`, `seed`, `scenarios`
-- `rodi_root`, `work`
-- provider-specific Google credentials/project/location fields
-
-Change hyperparameters by editing a YAML config or passing extra CLI arguments after the wrapper command.
-
-## Ablation Studies
-
-Candidate generation ablation:
-
-```bash
-docker run --rm --env-file .env \
-  -v /local/path/to/rodi:/data:ro \
-  -v /local/path/to/outputs:/outputs \
-  fgf-pipeline \
-  python scripts/run_ablation_candidate_generation.py --config configs/openai_best_fol_default.yaml
-```
-
-Matching ablation:
-
-```bash
-docker run --rm --env-file .env \
-  -v /local/path/to/rodi:/data:ro \
-  -v /local/path/to/outputs:/outputs \
-  fgf-pipeline \
-  python scripts/run_ablation_matching.py --config configs/openai_best_fol_default.yaml
-```
-
-FOL-method selection ablation:
-
-```bash
-docker run --rm --env-file .env \
-  -v /local/path/to/rodi:/data:ro \
-  -v /local/path/to/outputs:/outputs \
-  fgf-pipeline \
-  python scripts/run_ablation_fol_selection.py --config configs/openai_best_fol_default.yaml --scenario cmt_renamed
-```
-
-Failure analysis of missed SQL answers:
-
-```bash
-docker run --rm \
-  -v /local/path/to/outputs:/outputs \
-  fgf-pipeline \
-  python scripts/run_failure_analysis.py --metrics /outputs/per_qpair_metrics.csv --scenario cmt_renamed
-```
+Generated code is AST-validated and runs in a separate worker. Defaults are 120 seconds and 2048 MiB of worker address space, controlled by `CODING_FGF_SANDBOX_TIMEOUT_SECONDS` and `CODING_FGF_SANDBOX_MEMORY_MB`. Limit failures reject the candidate without partial RDF. These controls are not a general-purpose hostile-code isolation system.
 
 ## Tests
 
-Run the test suite inside Docker:
-
 ```bash
-docker run --rm fgf-pipeline pytest
+docker compose run --rm --no-deps fgf-pipeline python -m pytest -q -p no:cacheprovider
+docker compose -f docker-compose.smoke.yml up --build --abort-on-container-exit --exit-code-from smoke
+docker compose -f docker-compose.smoke.yml down -v
 ```
 
-Live API tests are skipped automatically unless credentials are available in the environment.
+The smoke workflow uses a synthetic fixture and a separate disposable PostgreSQL service. It makes no live provider calls.
 
+Live OpenAI tests require `RUN_LIVE_OPENAI=1`; the matching smoke requires `RUN_LIVE_LLM=1` and `OPENAI_API_KEY`. Credentials alone do not enable tests. CI runs offline tests and the container smoke without credentials.
 
-## Reproducibility Notes
-
-All final qpair scores should be computed only after generated Python FGF code materializes RDF. The portfolio selector uses internal diagnostics only and does not inspect SQL/SPARQL answers, query-pair failures, paper baselines, or gold mappings before output selection.
+See [method architecture](docs/CURRENT_ARCHITECTURE.md), [evaluation conventions](docs/evaluation.md), and [artifacts](docs/artifacts.md).

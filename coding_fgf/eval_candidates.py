@@ -109,7 +109,7 @@ FAILURE_FIELDS = [
 
 def run_candidate_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     started_at = time.perf_counter()
-    methods = validate_methods(args.methods)
+    methods = validate_methods(args.methods, args.embedding_provider)
     k_values = sorted(set(int(k) for k in args.k_values))
     if not k_values or max(k_values) > 20:
         raise SystemExit("--k-values must include values between 1 and 20")
@@ -161,6 +161,8 @@ def run_candidate_evaluation(args: argparse.Namespace) -> dict[str, Any]:
             target_records=data.target_records,
             cache_dir=cache_dir,
             embedding_model=args.embedding_model,
+            embedding_provider=args.embedding_provider, google_project=args.google_project,
+            google_location=args.google_location, google_credentials=args.google_credentials,
             logger=context_logger,
         )
         method_config = context.method_configs(k_values, max(k_values))
@@ -184,7 +186,9 @@ def run_candidate_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 source_id = str(source.get("id", ""))
                 mapping = gold_by_source.get(source_id)
                 candidates, rank_by_uri = rank_method(context, method, source, max_candidates=max(k_values))
-                candidate_artifact_rows.append(normalized_candidate_artifact(scenario, method, source, candidates))
+                candidate_artifact_rows.append({**normalized_candidate_artifact(scenario, method, source, candidates),
+                    "embedding_provider": args.embedding_provider, "embedding_model": args.embedding_model,
+                    "embedding_mode": "live"})
                 if mapping:
                     unit_row, gold_rows = evaluate_mapping(
                         mapping,
@@ -339,6 +343,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k-values", nargs="+", type=int, default=list(DEFAULT_K_VALUES))
     parser.add_argument("--output-dir", default="outputs/candidate_eval")
     parser.add_argument("--cache-dir", default=".cache/candidate_embeddings")
+    parser.add_argument("--embedding-provider", choices=["openai", "google"], default="openai")
+    parser.add_argument("--google-project", default="")
+    parser.add_argument("--google-location", default="")
+    parser.add_argument("--google-credentials", default="")
     parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
     parser.add_argument(
         "--no-llm-matching",

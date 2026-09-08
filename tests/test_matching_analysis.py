@@ -130,6 +130,7 @@ def write_candidate_artifact(path: Path, scenario: str) -> None:
         },
     ]
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    path.with_name("method_configs.json").write_text(json.dumps({"embedding_model":"text-embedding-3-small"}), encoding="utf-8")
 
 
 def test_prompt_construction_for_each_method() -> None:
@@ -438,13 +439,14 @@ def test_heatmap_generation_from_fake_metrics(tmp_path: Path) -> None:
     assert (tmp_path / "heatmaps" / "s1_method_metrics.png").exists()
 
 
-def test_adaptive_runner_drops_workers_and_returns_api_error_rows() -> None:
+def test_adaptive_runner_drops_workers_and_returns_api_error_rows(monkeypatch) -> None:
+    monkeypatch.setattr(matching_analysis.time, "sleep", lambda _: None)
     worker_counts: list[int] = []
     events: list[tuple[str, dict]] = []
 
     def worker(task: str, workers: int) -> dict:
         worker_counts.append(workers)
-        raise RuntimeError("simulated API failure")
+        raise TimeoutError("simulated API failure")
 
     def builder(task: str, error: str, attempts: int, workers: int) -> dict:
         return {"task": task, "api_error": True, "attempts": attempts, "workers": workers, "error": error}
@@ -454,17 +456,17 @@ def test_adaptive_runner_drops_workers_and_returns_api_error_rows() -> None:
         worker,
         builder,
         max_workers=4,
-        api_retries=0,
+        api_retries=2,
         logger=lambda event, **fields: events.append((event, fields)),
         context="test",
     )
-    assert worker_counts == [4, 4, 2, 1]
-    assert rows == [{"task": "x", "api_error": True, "attempts": 4, "workers": 1, "error": "RuntimeError: simulated API failure"}]
+    assert worker_counts == [4, 2, 1]
+    assert rows == [{"task": "x", "api_error": True, "attempts": 3, "workers": 1, "error": "TimeoutError: simulated API failure"}]
     assert [event for event, _ in events].count("api:workers_reduce") == 2
     assert events[-1][0] == "api:error_row"
 
 
-def test_adaptive_runner_no_api_error_mode_reduces_and_keeps_retrying(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_adaptive_runner_no_api_error_mode_reduces_and_recovers_within_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     worker_counts: list[int] = []
     events: list[tuple[str, dict]] = []
     calls = {"count": 0}
@@ -488,7 +490,7 @@ def test_adaptive_runner_no_api_error_mode_reduces_and_keeps_retrying(monkeypatc
         worker,
         lambda task, error, attempts, workers: {"api_error": True},
         max_workers=4,
-        api_retries=0,
+        api_retries=2,
         logger=lambda event, **fields: events.append((event, fields)),
         context="test_no_error_rows",
     )
@@ -521,7 +523,7 @@ def test_adaptive_runner_no_api_error_mode_uses_16_worker_ladder(monkeypatch: py
         worker,
         lambda task, error, attempts, workers: {"api_error": True},
         max_workers=16,
-        api_retries=0,
+        api_retries=4,
         context="test_16_ladder",
     )
     assert worker_counts == [16, 8, 4, 2, 1]
@@ -533,7 +535,7 @@ def test_adaptive_runner_no_api_error_mode_raises_setup_failures(monkeypatch: py
         raise RuntimeError("BadRequestError: invalid model")
 
     monkeypatch.setenv("CODING_FGF_NO_API_ERROR_ROWS", "1")
-    with pytest.raises(RuntimeError, match="Blocking API configuration error"):
+    with pytest.raises(RuntimeError, match="API task failed"):
         adaptive_map(
             ["x"],
             worker,

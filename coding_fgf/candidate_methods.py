@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from .constants import DEFAULT_EMBEDDING_MODEL
+from .embeddings import EmbeddingClient, cached_embeddings, embedding_key
 from .io import ensure_dir
 
 
-METHOD_OPENAI_SMALL = "openai_small"
+METHOD_DENSE = "dense"
+METHOD_OPENAI_SMALL = METHOD_DENSE  # compatibility constant
 METHOD_LEVENSHTEIN = "levenshtein"
 METHOD_BM25 = "bm25"
 METHOD_HYBRID_LEVENSHTEIN_DENSE = "hybrid_levenshtein_dense"
@@ -52,11 +54,19 @@ class RankedCandidate:
         }
 
 
-def validate_methods(methods: Sequence[str]) -> list[str]:
+def normalize_method(method: str, provider: str = "openai") -> str:
+    if method == "openai_small":
+        if provider != "openai":
+            raise ValueError("openai_small is an OpenAI-only legacy alias; use dense")
+        return METHOD_DENSE
+    return method
+
+def validate_methods(methods: Sequence[str], provider: str = "openai") -> list[str]:
+    methods = list(dict.fromkeys(normalize_method(m, provider) for m in methods))
     unknown = [method for method in methods if method not in DEFAULT_METHODS]
     if unknown:
-        raise ValueError(f"Unknown candidate generation method(s): {', '.join(unknown)}")
-    return list(methods)
+        raise ValueError(f"Unknown candidate methods: {unknown}")
+    return methods
 
 
 def token_list(value: object) -> list[str]:
@@ -144,114 +154,33 @@ class Bm25Index:
         return sorted(rows, key=lambda item: (-item[1], str(item[0].get("uri", ""))))
 
 
-def embedding_cache_key(model: str, text: str, verbalization_version: str = VERBALIZATION_VERSION) -> str:
-    payload = {"model": model, "text": text, "verbalization_version": verbalization_version}
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+def embedding_cache_key(model: str, text: str, verbalization_version: str = VERBALIZATION_VERSION,
+                        *, provider="openai", offline=False) -> str:
+    return embedding_key(model, text, provider=provider, offline=offline,
+                         verbalization_version=verbalization_version)
 
+class ProviderEmbeddingCache:
+    def __init__(self, cache_path, model=DEFAULT_EMBEDDING_MODEL, embedder=None,
+                 batch_size=64, logger=None, *, provider="openai", google_project="",
+                 google_location="", google_credentials=""):
+        self.cache_path, self.model = Path(cache_path), model
+        self.embedder, self.batch_size, self.logger = embedder, batch_size, logger
+        self.provider = provider
+        self.client = EmbeddingClient(model=model, provider=provider, google_project=google_project,
+                                      google_location=google_location, google_credentials=google_credentials)
 
-class OpenAIEmbeddingCache:
-    def __init__(
-        self,
-        cache_path: Path,
-        model: str = DEFAULT_EMBEDDING_MODEL,
-        embedder: EmbeddingFunction | None = None,
-        batch_size: int = 64,
-        logger: ProgressLogger | None = None,
-    ) -> None:
-        self.cache_path = cache_path
-        self.model = model
-        self.embedder = embedder
-        self.batch_size = batch_size
-        self.logger = logger
-        ensure_dir(cache_path.parent)
-        self.cache: dict[str, list[float]] = {}
-        if cache_path.exists():
-            for raw in cache_path.read_text(encoding="utf-8").splitlines():
-                if not raw.strip():
-                    continue
-                row = json.loads(raw)
-                if row.get("model") == model and isinstance(row.get("embedding"), list):
-                    self.cache[str(row["text_hash"])] = [float(v) for v in row["embedding"]]
+    def embed_texts(self, texts):
+        def embed_missing(missing):
+            if self.embedder:
+                return self.embedder(self.model, missing)
+            vectors = []
+            for start in range(0, len(missing), self.batch_size):
+                vectors.extend(self.client.embed(missing[start:start + self.batch_size]))
+            return vectors
+        return cached_embeddings(list(texts), self.cache_path, embed_missing, model=self.model,
+                                 provider=self.provider, verbalization_version=VERBALIZATION_VERSION)
 
-    def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
-        output: list[list[float] | None] = [None for _ in texts]
-        missing: list[tuple[int, str, str]] = []
-        for idx, text in enumerate(texts):
-            key = embedding_cache_key(self.model, text)
-            cached = self.cache.get(key)
-            if cached is None:
-                missing.append((idx, key, text))
-            else:
-                output[idx] = cached
-        if missing:
-            self._log(
-                "embedding_cache:miss",
-                texts=len(texts),
-                missing=len(missing),
-                cache_hits=len(texts) - len(missing),
-                model=self.model,
-            )
-            vectors = self._embed_missing(missing)
-            with self.cache_path.open("a", encoding="utf-8") as fh:
-                for (idx, key, text), vector in zip(missing, vectors):
-                    clean_vector = [float(v) for v in vector]
-                    self.cache[key] = clean_vector
-                    output[idx] = clean_vector
-                    fh.write(
-                        json.dumps(
-                            {
-                                "model": self.model,
-                                "text_hash": key,
-                                "text_preview": text[:120],
-                                "verbalization_version": VERBALIZATION_VERSION,
-                                "embedding": clean_vector,
-                            },
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        )
-                        + "\n"
-                    )
-            self._log("embedding_cache:write", rows=len(missing), cache_path=str(self.cache_path))
-        return [vector for vector in output if vector is not None]
-
-    def _embed_missing(self, missing: Sequence[tuple[int, str, str]]) -> list[list[float]]:
-        texts = [item[2] for item in missing]
-        if self.embedder:
-            return self.embedder(self.model, texts)
-        if not os.getenv("OPENAI_API_KEY"):
-            raise RuntimeError(
-                "OPENAI_API_KEY is required for uncached dense candidate evaluation; "
-                "the evaluator does not silently fall back to deterministic embeddings."
-            )
-        from openai import OpenAI  # type: ignore
-
-        client = OpenAI()
-        vectors: list[list[float]] = []
-        for start in range(0, len(texts), self.batch_size):
-            batch = texts[start : start + self.batch_size]
-            self._log(
-                "embedding_api:batch:start",
-                batch_start=start + 1,
-                batch_end=start + len(batch),
-                batch_total=len(texts),
-                model=self.model,
-            )
-            response = client.embeddings.create(model=self.model, input=batch)
-            vectors.extend([[float(v) for v in item.embedding] for item in response.data])
-            self._log(
-                "embedding_api:batch:complete",
-                batch_start=start + 1,
-                batch_end=start + len(batch),
-                batch_total=len(texts),
-                model=self.model,
-            )
-        return vectors
-
-    def _log(self, event: str, **fields: Any) -> None:
-        if not self.logger:
-            return
-        details = " ".join(f"{key}={value}" for key, value in fields.items())
-        self.logger(f"{event}" + (f" {details}" if details else ""))
+OpenAIEmbeddingCache = ProviderEmbeddingCache  # existing OpenAI callers retain their interface
 
 
 def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
@@ -296,6 +225,10 @@ class CandidateMethodContext:
     rrf_k: int = 60
     embedder: EmbeddingFunction | None = None
     logger: ProgressLogger | None = None
+    embedding_provider: str = "openai"
+    google_project: str = ""
+    google_location: str = ""
+    google_credentials: str = ""
     records_by_kind: dict[str, list[dict[str, Any]]] = field(init=False)
     levenshtein_text_by_uri: dict[str, str] = field(init=False)
     bm25_by_kind: dict[str, Bm25Index] = field(init=False)
@@ -303,7 +236,7 @@ class CandidateMethodContext:
     ranking_cache: dict[tuple[str, str], list[RankedCandidate]] = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.methods = validate_methods(self.methods)
+        self.methods = validate_methods(self.methods, self.embedding_provider)
         self.records_by_kind = {}
         for record in self.target_records:
             self.records_by_kind.setdefault(str(record.get("kind", "")), []).append(record)
@@ -314,10 +247,12 @@ class CandidateMethodContext:
         needs_dense = any("dense" in method or method == METHOD_OPENAI_SMALL for method in self.methods)
         if needs_dense:
             cache = OpenAIEmbeddingCache(
-                self.cache_dir / f"{self.embedding_model}.jsonl",
+                self.cache_dir / self.embedding_provider / f"{self.embedding_model}.jsonl",
                 self.embedding_model,
                 embedder=self.embedder,
-                logger=self.logger,
+                logger=self.logger, provider=self.embedding_provider,
+                google_project=self.google_project, google_location=self.google_location,
+                google_credentials=self.google_credentials,
             )
             self.dense_index = DenseIndex(self.records_by_kind, cache)
 
@@ -350,6 +285,7 @@ class CandidateMethodContext:
                     "components": [METHOD_BM25, METHOD_OPENAI_SMALL],
                 },
             },
+            "embedding_provider": self.embedding_provider,
             "embedding_model": self.embedding_model,
             "k_values": list(k_values),
             "max_candidates": max_candidates,
@@ -365,6 +301,7 @@ def rank_method(
     source: dict[str, Any],
     max_candidates: int = 20,
 ) -> tuple[list[RankedCandidate], dict[str, int]]:
+    method = normalize_method(method, context.embedding_provider)
     full = _rank_full(context, method, source)
     rank_by_uri = {candidate.uri: candidate.rank for candidate in full}
     return full[:max_candidates], rank_by_uri

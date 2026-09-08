@@ -33,24 +33,28 @@ def google_config(
     location: str | None = None,
     credentials: str | None = None,
 ) -> GoogleVertexConfig:
+    project = project or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GOOGLE_PROJECT")
+    if not project or project.startswith(chr(36) + "{"):
+        raise ValueError("A Google project is required; set GOOGLE_CLOUD_PROJECT or --google-project")
+    credentials = credentials or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if credentials and not os.path.isfile(credentials):
+        raise ValueError("Google credentials file not found; use its path inside the container")
     return GoogleVertexConfig(
-        project=project or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GOOGLE_PROJECT") or "project_o",
+        project=project,
         location=location or os.getenv("GOOGLE_CLOUD_LOCATION") or os.getenv("GOOGLE_LOCATION") or "global",
         credentials=credentials or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", ""),
         timeout_seconds=float(os.getenv("CODING_FGF_GOOGLE_TIMEOUT_SECONDS", "180")),
     )
 
 
-def _retry_config() -> tuple[float, float, float, int]:
-    initial = max(0.1, float(os.getenv("CODING_FGF_API_BACKOFF_INITIAL_SECONDS", "2")))
-    maximum = max(initial, float(os.getenv("CODING_FGF_API_BACKOFF_MAX_SECONDS", "120")))
-    jitter = max(0.0, float(os.getenv("CODING_FGF_API_BACKOFF_JITTER_SECONDS", "0.5")))
-    max_attempts = max(0, int(os.getenv("CODING_FGF_API_MAX_ATTEMPTS", "0")))
-    return initial, maximum, jitter, max_attempts
+from .providers import retry_config as _retry_config, request_with_retry
 
 
 def _model_output_max_attempts() -> int:
-    return max(1, int(os.getenv("CODING_FGF_MODEL_OUTPUT_MAX_ATTEMPTS", "6")))
+    value = int(os.getenv("CODING_FGF_MODEL_OUTPUT_MAX_ATTEMPTS", "6"))
+    if value <= 0:
+        raise ValueError("CODING_FGF_MODEL_OUTPUT_MAX_ATTEMPTS must be positive")
+    return value
 
 
 def _sleep(delay: float, jitter: float) -> None:
@@ -64,12 +68,21 @@ def _access_token(config: GoogleVertexConfig) -> str:
     except Exception as exc:  # pragma: no cover - exercised by environment
         raise GoogleVertexPermanentError("google-auth is required for Google Vertex AI mode") from exc
 
+    from google.auth.exceptions import DefaultCredentialsError, RefreshError
     scopes = [CLOUD_PLATFORM_SCOPE]
-    if config.credentials:
-        credentials, _ = google.auth.load_credentials_from_file(config.credentials, scopes=scopes)
-    else:
-        credentials, _ = google.auth.default(scopes=scopes)
-    credentials.refresh(Request())
+    try:
+        if config.credentials:
+            credentials, _ = google.auth.load_credentials_from_file(config.credentials, scopes=scopes)
+        else:
+            credentials, _ = google.auth.default(scopes=scopes)
+        credentials.refresh(Request())
+    except (DefaultCredentialsError, RefreshError) as exc:
+        error = GoogleVertexPermanentError(
+            "Google ADC credentials are missing or invalid; configure GOOGLE_APPLICATION_CREDENTIALS "
+            "to a readable container path or provide working application-default credentials")
+        if getattr(exc, "retryable", False):
+            error.status_code = 503
+        raise error from exc
     token = getattr(credentials, "token", None)
     if not token:
         raise GoogleVertexPermanentError("Google ADC did not produce an access token")
@@ -88,35 +101,18 @@ def _post_vertex(
     event_logger: Callable[[str], None] | None,
     event_prefix: str,
 ) -> dict[str, Any]:
-    token = _access_token(config)
-    initial_delay, max_delay, jitter, max_attempts = _retry_config()
-    parse_max_attempts = _model_output_max_attempts()
-    delay = initial_delay
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            response = requests.post(
-                url,
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=config.timeout_seconds,
-            )
-            if response.status_code in {400, 401, 403, 404}:
-                raise GoogleVertexPermanentError(f"Vertex call failed with HTTP {response.status_code}: {response.text[:500]}")
-            if response.status_code >= 429:
-                raise GoogleVertexError(f"Vertex retryable HTTP {response.status_code}: {response.text[:500]}")
-            response.raise_for_status()
-            return response.json()
-        except GoogleVertexPermanentError:
-            raise
-        except Exception as exc:
-            if max_attempts and attempt >= max_attempts:
-                raise GoogleVertexError(f"Vertex call failed after {attempt} attempts: {exc}") from exc
-            if event_logger:
-                event_logger(f"{event_prefix}:retry:attempt={attempt}:error={type(exc).__name__}:sleep={delay:.1f}")
-            _sleep(delay, jitter)
-            delay = min(delay * 2.0, max_delay)
+    def call():
+        token = _access_token(config)
+        response = requests.post(
+            url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload, timeout=config.timeout_seconds)
+        if response.status_code in {400, 401, 403, 404}:
+            error = GoogleVertexPermanentError(f"Vertex call failed with HTTP {response.status_code}")
+            error.status_code = response.status_code
+            raise error
+        response.raise_for_status()
+        return response.json()
+    return request_with_retry(call, event_logger=event_logger, label=event_prefix)
 
 
 def extract_generate_text(response: dict[str, Any]) -> str:
@@ -159,7 +155,7 @@ def parse_json_text(text: str) -> Any:
         return json.loads(cleaned[start : end + 1])
 
 
-def generate_json(
+def generate_json_with_metadata(
     prompt: str,
     schema_name: str,
     model: str,
@@ -181,36 +177,47 @@ def generate_json(
     parse_max_attempts = _model_output_max_attempts()
     delay = initial_delay
     attempt = 0
+    usage = {}
     while True:
         attempt += 1
         response = _post_vertex(url, payload, config, event_logger, f"google:{schema_name}")
+        raw_usage = response.get("usageMetadata", {}) or {}
+        for key, out in (("promptTokenCount", "input_tokens"), ("candidatesTokenCount", "output_tokens"),
+                         ("totalTokenCount", "total_tokens")):
+            if isinstance(raw_usage.get(key), int):
+                usage[out] = usage.get(out, 0) + raw_usage[key]
         try:
-            return parse_json_text(extract_generate_text(response))
+            data = parse_json_text(extract_generate_text(response))
+            return {"data": data, "usage": usage}
         except Exception as exc:
             if attempt >= parse_max_attempts:
                 raise GoogleVertexError(
                     f"Vertex JSON parse failed for {schema_name} after {attempt} model-output attempts: {exc}"
                 ) from exc
-            if max_attempts and attempt >= max_attempts:
-                raise GoogleVertexError(f"Vertex JSON parse failed for {schema_name} after {attempt} attempts: {exc}") from exc
             if event_logger:
                 event_logger(f"google:{schema_name}:json_retry:attempt={attempt}:error={type(exc).__name__}:sleep={delay:.1f}")
             _sleep(delay, jitter)
             delay = min(delay * 2.0, max_delay)
 
 
+def generate_json(prompt, schema_name, model, config, event_logger=None,
+                  temperature=0.0, max_output_tokens=None):
+    return generate_json_with_metadata(prompt, schema_name, model, config,
+        event_logger, temperature, max_output_tokens)["data"]
+
+
 def _extract_embedding(prediction: dict[str, Any]) -> list[float]:
     if isinstance(prediction.get("embeddings"), dict):
         values = prediction["embeddings"].get("values")
         if values is not None:
-            return [float(value) for value in values]
+            return values
     if isinstance(prediction.get("embedding"), dict):
         values = prediction["embedding"].get("values")
         if values is not None:
-            return [float(value) for value in values]
+            return values
     values = prediction.get("values")
     if values is not None:
-        return [float(value) for value in values]
+        return values
     raise GoogleVertexError(f"No embedding values found in prediction: {json.dumps(prediction)[:500]}")
 
 
@@ -242,4 +249,5 @@ def embed_texts(
         if len(predictions) != len(batch):
             raise GoogleVertexError(f"Expected {len(batch)} embeddings, received {len(predictions)}")
         vectors.extend(_extract_embedding(prediction) for prediction in predictions)
-    return vectors
+    from .embeddings import validate_vectors
+    return validate_vectors(vectors, len(texts))

@@ -14,6 +14,7 @@ except ImportError as exc:  # pragma: no cover
 
 BOOL_FLAGS = {
     "fol_portfolio": "--fol-portfolio",
+    "fol_ablation_report": "--fol-ablation-report",
     "attribute_coverage_validation": "--attribute-coverage-validation",
     "attribute_coverage_repair": "--attribute-coverage-repair",
     "fewshot_include_matching": "--fewshot-include-matching",
@@ -104,3 +105,35 @@ def run_or_print(cmd: list[str], dry_run: bool) -> int:
     if dry_run:
         return 0
     return subprocess.call(cmd)
+
+
+def ablation_command(config: dict[str, Any], kind: str, *, scenario=None,
+                     output_dir=None, candidate_artifact=None, extra_args=None) -> list[str]:
+    base = Path(str(config.get("work", "/outputs/run"))) / "ablations"
+    scenarios = scenario_arg(config, scenario).split(",")
+    if kind == "fol_selection":
+        cfg = dict(config, work=str(output_dir or base / kind), fol_portfolio=True,
+                   fol_ablation_report=True)
+        cfg.setdefault("fol_portfolio_arms", ["full9_default", "stage2_hybrid", "stage2c_round2_only"])
+        cfg.setdefault("fol_portfolio_selector", "internal_materialization")
+        return pipeline_command(cfg, scenario, extra_args)
+    module = "coding_fgf.eval_candidates" if kind == "candidate_generation" else "coding_fgf.analysis.matching_analysis"
+    cmd = [sys.executable, "-m", module, "--rodi-root", str(config.get("rodi_root", "/data")),
+           "--output-dir", str(output_dir or base / kind), "--scenarios", *scenarios,
+           "--cache-dir", str(base / "embedding_cache")]
+    fields = ["embedding_provider", "embedding_model", "google_project", "google_location", "google_credentials"]
+    for key in fields:
+        value = config.get(key)
+        if value:
+            cmd.extend(["--" + key.replace("_", "-"), str(value)])
+    if kind == "candidate_generation":
+        values = config.get("k_values") or [config.get("k", 16)]
+        cmd.extend(["--k-values", *map(str, values)])
+    else:
+        cmd.extend(["--candidate-artifact", str(candidate_artifact or base / "candidate_generation" / "candidates_by_method.jsonl")])
+        for key, flag in (("llm_provider", "--llm-provider"), ("llm_model", "--model"),
+                          ("k", "--top-k"), ("match_workers", "--max-workers"),
+                          ("fallback_model", "--fallback-model"), ("api_retries", "--api-retries")):
+            if config.get(key) is not None:
+                cmd.extend([flag, str(config[key])])
+    return cmd + list(extra_args or [])

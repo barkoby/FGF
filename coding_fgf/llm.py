@@ -20,16 +20,14 @@ CODEGEN_PROMPT_VERSION = "fgf_codegen_v3_runtime_validated"
 CODEGEN_FEW_SHOT_PROMPT_VERSION = "fgf_codegen_v4_fewshot_runtime_validated"
 
 
-def _retry_config() -> tuple[float, float, float, int]:
-    initial = max(0.1, float(os.getenv("CODING_FGF_API_BACKOFF_INITIAL_SECONDS", "2")))
-    maximum = max(initial, float(os.getenv("CODING_FGF_API_BACKOFF_MAX_SECONDS", "120")))
-    jitter = max(0.0, float(os.getenv("CODING_FGF_API_BACKOFF_JITTER_SECONDS", "0.5")))
-    max_attempts = max(0, int(os.getenv("CODING_FGF_API_MAX_ATTEMPTS", "0")))
-    return initial, maximum, jitter, max_attempts
+from .providers import retry_config as _retry_config, structured_generate
 
 
 def _model_output_max_attempts() -> int:
-    return max(1, int(os.getenv("CODING_FGF_MODEL_OUTPUT_MAX_ATTEMPTS", "6")))
+    value = int(os.getenv("CODING_FGF_MODEL_OUTPUT_MAX_ATTEMPTS", "6"))
+    if value <= 0:
+        raise ValueError("CODING_FGF_MODEL_OUTPUT_MAX_ATTEMPTS must be positive")
+    return value
 
 
 def _sleep_before_retry(delay: float, jitter: float) -> None:
@@ -919,52 +917,11 @@ def call_structured_json(
     google_location: str = "",
     google_credentials: str = "",
 ) -> Any:
-    if provider == "google":
-        from .google_vertex import generate_json, google_config
-
-        return generate_json(
-            prompt,
-            schema_name,
-            requested_model,
-            google_config(google_project or None, google_location or None, google_credentials or None),
-            event_logger=_append_llm_event,
-        )
-    if provider != "openai":
-        raise ValueError(f"Unsupported LLM provider: {provider}")
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY is not set")
-    from openai import OpenAI  # type: ignore
-
-    client = OpenAI()
-    initial_delay, max_delay, jitter, max_attempts = _retry_config()
-    delay = initial_delay
-    attempt = 0
-    model = requested_model
-    while True:
-        attempt += 1
-        try:
-            response = client.responses.create(
-                model=model,
-                input=prompt,
-                text={"format": {"type": "json_object"}},
-            )
-            text = getattr(response, "output_text", "")
-            if not text:
-                text = response.output[0].content[0].text  # type: ignore[attr-defined]
-            if not text:
-                raise ValueError("empty structured JSON response")
-            return json.loads(text)
-        except Exception as exc:
-            if max_attempts and attempt >= max_attempts:
-                _append_llm_event(
-                    f"api:retry_exhausted:schema={schema_name}:model={model}:attempt={attempt}:error={type(exc).__name__}"
-                )
-                raise RuntimeError(f"OpenAI call failed for {schema_name} after {attempt} attempts: {exc}") from exc
-            _append_llm_event(
-                f"api:retry:schema={schema_name}:model={model}:attempt={attempt}:error={type(exc).__name__}:sleep={delay:.1f}"
-            )
-            _sleep_before_retry(delay, jitter)
-            delay = min(delay * 2.0, max_delay)
+    return structured_generate(
+        prompt, schema_name, requested_model, provider=provider,
+        google_project=google_project, google_location=google_location,
+        google_credentials=google_credentials, event_logger=_append_llm_event,
+    ).data
 
 
 def _match_one_live(
@@ -1016,8 +973,6 @@ def _match_one_live(
                     reason=f"model output failed generic candidate validation after {attempt} attempts",
                 )
             ], False
-        if max_attempts and attempt >= max_attempts:
-            raise RuntimeError(f"LLM returned no valid match for {source_id} after {attempt} attempts")
         _append_llm_event(f"match:validation_retry:source={source_id}:attempt={attempt}:sleep={delay:.1f}")
         _sleep_before_retry(delay, jitter)
         delay = min(delay * 2.0, max_delay)
@@ -2199,8 +2154,6 @@ def llm_codegen(
             return str(code)
         if attempt >= validation_max_attempts:
             raise RuntimeError(f"LLM returned empty code after {attempt} model-output attempts")
-        if max_attempts and attempt >= max_attempts:
-            raise RuntimeError(f"LLM returned empty code after {attempt} attempts")
         _append_llm_event(f"codegen:validation_retry:attempt={attempt}:sleep={delay:.1f}")
         _sleep_before_retry(delay, jitter)
         delay = min(delay * 2.0, max_delay)

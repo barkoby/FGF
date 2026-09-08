@@ -10,8 +10,6 @@ PAPER_SCENARIOS = [
     "sigkdd_mixed",
     "conference_nofks",
     "cmt_denormalized",
-    "mondial_rel",
-    "npd_atomic_tests",
 ]
 
 # Reference scores are not distributed; comparison fields remain empty when absent.

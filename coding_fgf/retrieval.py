@@ -6,6 +6,7 @@ from typing import Iterable
 
 from .io import ensure_dir, read_jsonl, write_jsonl
 from .lexical import words
+from .embeddings import validate_vectors
 
 
 def build_index(embedded_records: Iterable[dict[str, object]], work_dir: Path) -> Path:
@@ -13,7 +14,7 @@ def build_index(embedded_records: Iterable[dict[str, object]], work_dir: Path) -
     ensure_dir(work_dir)
     if not rows:
         raise ValueError("No embedded records to index")
-    vectors = [row["embedding"] for row in rows]
+    vectors = validate_vectors([row["embedding"] for row in rows], len(rows))
     write_jsonl(work_dir / "index_meta.jsonl", [{k: v for k, v in row.items() if k != "embedding"} for row in rows])
     (work_dir / "index_vectors.json").write_text(json.dumps(vectors), encoding="utf-8")
     try:
@@ -34,6 +35,8 @@ def _load_vectors(work_dir: Path) -> list[list[float]]:
 
 
 def _l2(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right):
+        raise ValueError("Embedding dimension mismatch in retrieval")
     return sum((a - b) * (a - b) for a, b in zip(left, right))
 
 
@@ -57,14 +60,14 @@ def retrieve_candidates(
     same_kind: bool = True,
 ) -> list[dict[str, object]]:
     meta = read_jsonl(work_dir / "index_meta.jsonl")
-    vectors = _load_vectors(work_dir)
+    vectors = validate_vectors(_load_vectors(work_dir), len(meta))
     rows: list[dict[str, object]] = []
     for source in source_records:
         source_clean = {key: value for key, value in source.items() if key != "embedding"}
         if source.get("kind") == "class" and source.get("table_role") == "join_table":
             rows.append({"source": source_clean, "candidates": []})
             continue
-        query = list(source["embedding"])  # type: ignore[arg-type]
+        query = validate_vectors([list(source["embedding"])], 1, len(vectors[0]))[0]  # type: ignore[arg-type]
         distances = [_l2(vector, query) for vector in vectors]
         order = sorted(range(len(distances)), key=lambda idx: distances[idx] - _lexical_bonus(source, meta[idx]))
         candidates = []

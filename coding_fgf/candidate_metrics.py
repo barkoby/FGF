@@ -118,7 +118,7 @@ def assign_failure_category(
         return "ambiguous_candidates"
     if method == METHOD_LEVENSHTEIN:
         return "lexical_rename_failure"
-    if method == METHOD_OPENAI_SMALL:
+    if method in {METHOD_OPENAI_SMALL, "openai_small"}:
         return "dense_semantic_failure"
     if method == METHOD_BM25:
         return "bm25_tokenization_failure"
