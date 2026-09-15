@@ -22,6 +22,10 @@ BOOL_FLAGS = {
     "fewshot_include_codegen": "--fewshot-include-codegen",
 }
 VALUE_FLAGS = {
+    "retrieval_metric": "--retrieval-metric",
+    "match_candidate_limit": "--match-candidate-limit",
+    "match_candidate_context": "--match-candidate-context",
+    "match_validation": "--match-validation",
     "rodi_root": "--rodi-root",
     "work": "--work",
     "fraction": "--fraction",

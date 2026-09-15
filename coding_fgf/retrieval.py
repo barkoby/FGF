@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -68,8 +70,18 @@ def retrieve_candidates(
             rows.append({"source": source_clean, "candidates": []})
             continue
         query = validate_vectors([list(source["embedding"])], 1, len(vectors[0]))[0]  # type: ignore[arg-type]
-        distances = [_l2(vector, query) for vector in vectors]
-        order = sorted(range(len(distances)), key=lambda idx: distances[idx] - _lexical_bonus(source, meta[idx]))
+        metric = os.getenv("CODING_FGF_RETRIEVAL_METRIC", "legacy")
+        if metric not in {"legacy", "cosine"}:
+            raise ValueError("Retrieval metric must be legacy or cosine")
+        if metric == "cosine":
+            norm = math.sqrt(sum(x*x for x in query))
+            if not norm or any(not any(v) for v in vectors):
+                raise ValueError("Cosine retrieval requires nonzero vectors")
+            distances = [1 - sum(a*b for a,b in zip(vector, query)) / (norm * math.sqrt(sum(x*x for x in vector))) for vector in vectors]
+            order = sorted(range(len(distances)), key=lambda idx: (distances[idx], str(meta[idx].get("uri", ""))))
+        else:
+            distances = [_l2(vector, query) for vector in vectors]
+            order = sorted(range(len(distances)), key=lambda idx: distances[idx] - _lexical_bonus(source, meta[idx]))
         candidates = []
         for idx in order:
             candidate = meta[int(idx)]

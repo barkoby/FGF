@@ -73,7 +73,7 @@ def decide_promotion(
     invalid_rules: int,
     similarity_margin: float = 0.05,
 ) -> PromotionDecision:
-    fallback_f1 = PAPER_TARGET_F1.get(scenario)
+    fallback_f1 = None
     baseline = llm4vkg_f1 if llm4vkg_f1 is not None else fallback_f1
     if coding_f1 is None:
         return PromotionDecision(scenario, coding_f1, llm4vkg_f1, fallback_f1, invalid_rules, similarity_margin, False, "missing coding_fgf F1")

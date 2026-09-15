@@ -55,7 +55,7 @@ docker compose run --rm fgf-pipeline python scripts/run_pipeline.py \
 
 For Gemma, substitute its config. Provider/model access must be available in your account.
 
-YAML controls models, candidate count `k`, workers, code-generation candidates, scenarios, and FOL features. Extra wrapper arguments override generated CLI arguments. Live runs never substitute deterministic embeddings. Explicit `--offline` mode is for fixture tests and demonstrations.
+YAML controls models, candidate count `k`, workers, code-generation candidates, scenarios, and FOL features. Matching settings are explicit: `retrieval_metric` (`legacy` or `cosine`), `match_candidate_limit`, `match_candidate_context` (`minimal` or `full`), and `match_validation` (`suspicious` or `all`). Extra wrapper arguments override generated CLI arguments. Live runs never substitute deterministic embeddings. Explicit `--offline` mode is for fixture tests and demonstrations.
 
 ## Ablations
 
@@ -92,6 +92,8 @@ Successful queries are excluded. Labels are diagnostic heuristics, not proven ca
 
 Transient provider failures receive three total request attempts by default; permanent configuration errors fail immediately. `CODING_FGF_API_MAX_ATTEMPTS` must be positive. Malformed output has a separate bounded `CODING_FGF_MODEL_OUTPUT_MAX_ATTEMPTS` limit (default six). Matching has no implicit model fallback; an explicitly configured fallback stays within the selected provider and is recorded.
 
+OpenAI matching uses a request-specific strict JSON schema. Every provider response is checked for the exact source identifier, an allowed target URI, consistent target identifiers, and finite confidence. Invalid responses receive bounded corrective feedback. Semantic review keeps lexical and foreign-key heuristics as recorded warnings; those heuristics alone do not prove that an allowed mapping is invalid. Structural kind mismatches still fail validation. An internal target identifier in generated FOL is normalized only when it maps unambiguously to an accepted match of the same kind. Raw rules and normalization diagnostics remain available for inspection.
+
 Embedding cache version 2 separates provider, model, live/offline mode, and verbalization version. Legacy entries remain on disk but are not reused automatically; the next live run may make new embedding requests.
 
 Generated code is AST-validated and runs in a separate worker. Defaults are 120 seconds and 2048 MiB of worker address space, controlled by `CODING_FGF_SANDBOX_TIMEOUT_SECONDS` and `CODING_FGF_SANDBOX_MEMORY_MB`. Limit failures reject the candidate without partial RDF. These controls are not a general-purpose hostile-code isolation system.
@@ -107,5 +109,7 @@ docker compose -f docker-compose.smoke.yml down -v
 The smoke workflow uses a synthetic fixture and a separate disposable PostgreSQL service. It makes no live provider calls.
 
 Live OpenAI tests require `RUN_LIVE_OPENAI=1`; the matching smoke requires `RUN_LIVE_LLM=1` and `OPENAI_API_KEY`. Credentials alone do not enable tests. CI runs offline tests and the container smoke without credentials.
+
+No benchmark results or reference scores are bundled. Comparisons require a supplied baseline; absent reference fields remain empty.
 
 See [method architecture](docs/CURRENT_ARCHITECTURE.md), [evaluation conventions](docs/evaluation.md), and [artifacts](docs/artifacts.md).

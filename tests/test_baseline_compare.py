@@ -649,7 +649,7 @@ def test_live_matching_uses_one_compact_request_per_source(monkeypatch) -> None:
 
     import coding_fgf.llm as llm_module
 
-    def fake_call(prompt: str, schema_name: str, requested_model: str, fallback_model: str) -> dict[str, object]:
+    def fake_call(prompt: str, schema_name: str, requested_model: str, fallback_model: str | None, **kwargs) -> dict[str, object]:
         prompts.append(prompt)
         payload = json.loads(prompt.split("\n\n", 1)[1])
         source_id = payload["source"]["id"]
@@ -698,7 +698,7 @@ def test_live_matching_thread_pool_preserves_order_and_events(monkeypatch) -> No
             worker_counts.append(kwargs.get("max_workers"))
             super().__init__(*args, **kwargs)
 
-    def fake_call(prompt: str, schema_name: str, requested_model: str, fallback_model: str) -> dict[str, object]:
+    def fake_call(prompt: str, schema_name: str, requested_model: str, fallback_model: str | None, **kwargs) -> dict[str, object]:
         payload = json.loads(prompt.split("\n\n", 1)[1])
         source_id = payload["source"]["id"]
         candidate = payload["candidates"][0]
@@ -739,7 +739,7 @@ def test_live_matching_no_api_fallback_on_call_error(monkeypatch) -> None:
     }
     import coding_fgf.llm as llm_module
 
-    def fail_call(prompt: str, schema_name: str, requested_model: str, fallback_model: str) -> dict[str, object]:
+    def fail_call(prompt: str, schema_name: str, requested_model: str, fallback_model: str | None, **kwargs) -> dict[str, object]:
         raise RuntimeError("api pressure")
 
     monkeypatch.setenv("OPENAI_API_KEY", "test")
@@ -759,7 +759,7 @@ def test_live_matching_bounds_invalid_model_output_retries(monkeypatch) -> None:
 
     calls = 0
 
-    def invalid_call(prompt: str, schema_name: str, requested_model: str, fallback_model: str) -> dict[str, object]:
+    def invalid_call(prompt: str, schema_name: str, requested_model: str, fallback_model: str | None, **kwargs) -> dict[str, object]:
         nonlocal calls
         calls += 1
         return {"matches": [{"source_id": "source-class:t", "target_uri": "http://ex#NotACandidate"}]}
@@ -788,7 +788,7 @@ def test_live_matching_progress_logs(monkeypatch) -> None:
     ]
     import coding_fgf.llm as llm_module
 
-    def fake_call(prompt: str, schema_name: str, requested_model: str, fallback_model: str) -> dict[str, object]:
+    def fake_call(prompt: str, schema_name: str, requested_model: str, fallback_model: str | None, **kwargs) -> dict[str, object]:
         payload = json.loads(prompt.split("\n\n", 1)[1])
         candidate = payload["candidates"][0]
         return {"matches": [{"source_id": payload["source"]["id"], "target_uri": candidate["uri"], "target_id": candidate["id"]}]}
@@ -833,7 +833,7 @@ def test_deterministic_pre_repair_skips_live_api(monkeypatch) -> None:
     }
     import coding_fgf.llm as llm_module
 
-    def fail_call(prompt: str, schema_name: str, requested_model: str, fallback_model: str) -> dict[str, object]:
+    def fail_call(prompt: str, schema_name: str, requested_model: str, fallback_model: str | None, **kwargs) -> dict[str, object]:
         raise AssertionError("live API should be skipped for deterministic repair")
 
     logs: list[str] = []

@@ -363,7 +363,7 @@ def _scenario_summary_row(scenario: str, rows: list[Mapping[str, Any]]) -> dict[
     final = rows[-1]
     final_f1 = _optional_float(final.get("f1"))
     passed = bool(final_f1 is not None and target is not None and final_f1 >= target + 0.01)
-    status = "passed" if passed else ("pending" if final_f1 is None else "blocked")
+    status = "pending" if final_f1 is None else ("uncompared" if target is None else ("passed" if passed else "blocked"))
     scenario_work = Path(str(final.get("artifact_path", "")))
     failures = failed_qpairs(scenario_work) if scenario_work.exists() else []
     cause_counts = Counter(likely_failure_cause(row) for row in failures)

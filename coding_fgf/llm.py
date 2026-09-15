@@ -13,6 +13,7 @@ from .constants import FALLBACK_CODE_MODEL, FALLBACK_MATCH_MODEL, REQUESTED_CODE
 from .lexical import words
 from .object_evidence import filter_object_evidence_for_matches
 from .schema import Table, foreign_key_columns, is_generic_identifier_column, table_role
+from .match_contract import match_output_schema, match_response_issues, validation_feedback
 
 _LLM_EVENTS: list[str] = []
 _LLM_EVENTS_LOCK = Lock()
@@ -293,7 +294,11 @@ def compact_candidate_rows(candidate_rows: list[dict[str, Any]], max_candidates:
     ]
 
 
-def compact_match_request(candidate_row: dict[str, Any], max_candidates: int = 8) -> dict[str, Any]:
+def compact_match_request(candidate_row: dict[str, Any], max_candidates: int | None = None) -> dict[str, Any]:
+    if max_candidates is None:
+        max_candidates = int(os.getenv("CODING_FGF_MATCH_CANDIDATE_LIMIT", "8"))
+    if max_candidates <= 0:
+        raise ValueError("Matching candidate limit must be positive")
     return {
         "source": _compact_entity(candidate_row.get("source", {}), max_text=900),
         "candidates": [
@@ -330,6 +335,10 @@ def _minimal_candidate(entity: dict[str, Any], max_text: int) -> dict[str, Any]:
     }
     if entity.get("distance") is not None:
         compact["distance"] = entity.get("distance")
+    if os.getenv("CODING_FGF_MATCH_CANDIDATE_CONTEXT", "full" if os.getenv("CODING_FGF_MATCH_CANDIDATE_LIMIT") else "minimal") == "full":
+        for key in ("kind", "label", "local_name", "domain", "range", "parents", "comment"):
+            if entity.get(key):
+                compact[key] = entity[key]
     return compact
 
 
@@ -716,9 +725,11 @@ def _call_json_for_provider(
     google_location: str = "",
     google_credentials: str = "",
     fallback_model: str | None = None,
+    output_schema: dict[str, Any] | None = None,
 ) -> Any:
+    extra = {"output_schema": output_schema} if output_schema is not None else {}
     if provider == "openai":
-        return call_structured_json(prompt, schema_name, model, fallback_model)
+        return call_structured_json(prompt, schema_name, model, fallback_model, **extra)
     return call_structured_json(
         prompt,
         schema_name,
@@ -728,6 +739,7 @@ def _call_json_for_provider(
         google_project=google_project,
         google_location=google_location,
         google_credentials=google_credentials,
+        **extra,
     )
 
 
@@ -743,9 +755,10 @@ def llm_discriminator_matches(
     validation_max_attempts = _model_output_max_attempts()
     for index, candidate_row in enumerate(candidate_rows, start=1):
         source_id = str(candidate_row.get("source", {}).get("id", ""))
+        feedback = ""
         for attempt in range(1, validation_max_attempts + 1):
             data = _call_json_for_provider(
-                _discriminator_prompt(candidate_row),
+                _discriminator_prompt(candidate_row) + feedback,
                 f"discriminator_match_{index}",
                 provider,
                 model,
@@ -753,14 +766,17 @@ def llm_discriminator_matches(
                 google_location,
                 google_credentials,
                 fallback_model=FALLBACK_MATCH_MODEL,
+                output_schema=match_output_schema(candidate_row),
             )
-            rows = data.get("matches", []) if isinstance(data, dict) else []
+            issues = match_response_issues(data, candidate_row)
+            rows = [] if issues else data["matches"]
             parsed = [_validate_discriminator_output(row, candidate_row) for row in rows]
             parsed = [row for row in parsed if row is not None]
             if parsed:
                 out.append(parsed[0])
                 break
             _append_llm_event(f"discriminator:validation_retry:source={source_id}:attempt={attempt}")
+            feedback = validation_feedback(issues)
         else:
             out.append(
                 {
@@ -783,6 +799,8 @@ def llm_discriminator_matches(
                     "invalid_selection": True,
                 }
             )
+    if os.getenv("CODING_FGF_MATCH_VALIDATION") == "all":
+        out, _ = review_all_matches(out, candidate_rows, {}, provider, model, google_project, google_location, google_credentials)
     return out
 
 
@@ -844,6 +862,64 @@ def _validation_reask_prompt(match: dict[str, Any], candidate_row: dict[str, Any
     )
 
 
+
+def review_all_matches(matches, candidate_rows, tables, provider="openai", model=REQUESTED_MATCH_MODEL,
+                       google_project="", google_location="", google_credentials=""):
+    """One semantic validation pass, using the original candidate set and source evidence."""
+    by_source = {str(row["source"]["id"]): row for row in candidate_rows}
+    def review(match):
+        source_id = str(match["source_id"])
+        candidate_row = by_source.get(source_id)
+        if not candidate_row or not candidate_row.get("candidates"):
+            return match, {"source_id": source_id, "status": "no_candidates", "before": match, "after": match}
+        discriminator = source_id.startswith("source-discriminator:")
+        request = _discriminator_prompt(candidate_row) if discriminator else _match_prompt(candidate_row)
+        prompt = (
+            "Independently validate the previous mapping. Return the same matches JSON shape. "
+            "Review positive AND null decisions using only the supplied source evidence and candidates. "
+            "Check entity versus group/role, kind, domain/range, labels, keys, relationship endpoints, "
+            "and value patterns. A numeric discriminator's value/order is not evidence of subclass meaning. "
+            "Use null when its meaning is unidentifiable. Distinguish lookup labels from opaque identifiers. "
+            "Do not invent meanings from benchmark familiarity. Keep the supplied row_filter unchanged. "
+            "Give a short reason citing concrete supplied source evidence.\n"
+            + json.dumps({"previous_decision": match}, ensure_ascii=False) + "\n" + request)
+        feedback = ""
+        for attempt in range(_model_output_max_attempts()):
+            data = _call_json_for_provider(prompt + feedback, "semantic_validation", provider, model,
+                                          google_project, google_location, google_credentials,
+                                          output_schema=match_output_schema(candidate_row))
+            issues = match_response_issues(data, candidate_row)
+            raw = [] if issues else data["matches"]
+            if discriminator:
+                parsed = [_validate_discriminator_output(r, candidate_row) for r in raw]
+                parsed = [r for r in parsed if r]
+            else:
+                parsed = [asdict(r) for r in validate_matches(raw, [candidate_row])]
+            semantic_warnings = []
+            if parsed:
+                # Lexical/FK heuristics are review evidence, not proof that a
+                # supplied mapping is structurally invalid (especially after renaming).
+                for issue in match_validation_issues(parsed[0], tables):
+                    if issue.startswith("kind_mismatch:"):
+                        issues.append(issue)
+                    else:
+                        semantic_warnings.append(issue)
+            if len(parsed) == 1 and not issues:
+                break
+            feedback = validation_feedback(issues)
+        else:
+            raise RuntimeError("Semantic validation did not return one schema-valid decision after bounded attempts")
+        replacement = parsed[0]
+        replacement["validation"] = {"strategy": "validation", "initial_decision": match,
+                                     "semantic_warnings": semantic_warnings}
+        return replacement, {"source_id": source_id, "status": "reviewed", "before": match,
+                             "after": replacement, "semantic_warnings": semantic_warnings}
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(review, matches))
+    return [r[0] for r in results], [r[1] for r in results]
+
+
 def reask_suspicious_matches(
     matches: list[dict[str, Any]],
     candidate_rows: list[dict[str, Any]],
@@ -854,6 +930,8 @@ def reask_suspicious_matches(
     google_location: str = "",
     google_credentials: str = "",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if os.getenv("CODING_FGF_MATCH_VALIDATION") == "all":
+        return review_all_matches(matches, candidate_rows, tables, provider, model, google_project, google_location, google_credentials)
     by_source = {str(row.get("source", {}).get("id", "")): row for row in candidate_rows}
     updated: list[dict[str, Any]] = []
     report: list[dict[str, Any]] = []
@@ -867,9 +945,10 @@ def reask_suspicious_matches(
         candidate_row = by_source.get(source_id)
         replacement: dict[str, Any] | None = None
         if candidate_row:
+            feedback = ""
             for attempt in range(1, validation_max_attempts + 1):
                 data = _call_json_for_provider(
-                    _validation_reask_prompt(match, candidate_row, issues),
+                    _validation_reask_prompt(match, candidate_row, issues) + feedback,
                     f"match_validation_{source_id.replace(':', '_').replace('.', '_')}",
                     provider,
                     model,
@@ -877,8 +956,10 @@ def reask_suspicious_matches(
                     google_location,
                     google_credentials,
                     fallback_model=FALLBACK_MATCH_MODEL,
+                    output_schema=match_output_schema(candidate_row),
                 )
-                parsed = validate_matches(data.get("matches", []) if isinstance(data, dict) else [], [candidate_row])
+                response_issues = match_response_issues(data, candidate_row)
+                parsed = [] if response_issues else validate_matches(data["matches"], [candidate_row])
                 if parsed:
                     row = asdict(parsed[0])
                     remaining = match_validation_issues(row, tables)
@@ -887,6 +968,7 @@ def reask_suspicious_matches(
                         break
                     issues = remaining
                 _append_llm_event(f"match_validation:retry:source={source_id}:attempt={attempt}")
+                feedback = validation_feedback(response_issues or issues)
         if replacement is None:
             replacement = dict(match)
             replacement.update(
@@ -916,11 +998,13 @@ def call_structured_json(
     google_project: str = "",
     google_location: str = "",
     google_credentials: str = "",
+    output_schema: dict[str, Any] | None = None,
 ) -> Any:
     return structured_generate(
         prompt, schema_name, requested_model, provider=provider,
         google_project=google_project, google_location=google_location,
         google_credentials=google_credentials, event_logger=_append_llm_event,
+        **({"output_schema": output_schema} if output_schema is not None else {}),
     ).data
 
 
@@ -939,11 +1023,13 @@ def _match_one_live(
     attempt = 0
     source_id = str(candidate_row.get("source", {}).get("id", ""))
     validation_max_attempts = _model_output_max_attempts()
+    feedback = ""
     while True:
         attempt += 1
-        prompt = _match_prompt(candidate_row, few_shot_examples=few_shot_examples)
+        prompt = _match_prompt(candidate_row, few_shot_examples=few_shot_examples) + feedback
         if provider == "openai":
-            data = call_structured_json(prompt, "matches", model, FALLBACK_MATCH_MODEL)
+            data = call_structured_json(prompt, "matches", model, FALLBACK_MATCH_MODEL,
+                                        output_schema=match_output_schema(candidate_row))
         else:
             data = call_structured_json(
                 prompt,
@@ -954,8 +1040,10 @@ def _match_one_live(
                 google_project=google_project,
                 google_location=google_location,
                 google_credentials=google_credentials,
+                output_schema=match_output_schema(candidate_row),
             )
-        matches = validate_matches(data.get("matches", []), [candidate_row])
+        issues = match_response_issues(data, candidate_row)
+        matches = [] if issues else validate_matches(data["matches"], [candidate_row])
         if matches:
             return matches[:1], False
         if attempt >= validation_max_attempts:
@@ -974,6 +1062,7 @@ def _match_one_live(
                 )
             ], False
         _append_llm_event(f"match:validation_retry:source={source_id}:attempt={attempt}:sleep={delay:.1f}")
+        feedback = validation_feedback(issues)
         _sleep_before_retry(delay, jitter)
         delay = min(delay * 2.0, max_delay)
 

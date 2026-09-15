@@ -1,5 +1,5 @@
 # Default OpenAI configuration for the public release.
-# Uses GPT/OpenAI with the academic-safe FOL portfolio selector.
+# Uses GPT/OpenAI with the internal materialization-based FOL portfolio selector.
 rodi_root: /data
 work: /outputs/openai_best_fol_default
 scenarios:
@@ -9,7 +9,7 @@ seed: coding-fgf-dev10-v1
 embedding_provider: openai
 embedding_model: text-embedding-3-small
 llm_provider: openai
-llm_model: gpt-5.4-nano
+llm_model: gpt-5.4-nano-2026-03-17
 k: 16
 match_workers: 4
 codegen_self_consistency: 3
@@ -20,3 +20,9 @@ fol_portfolio_arms:
   - stage2_hybrid
   - stage2c_round2_only
 fol_portfolio_selector: internal_materialization
+
+# Matching and retrieval settings.
+retrieval_metric: cosine
+match_candidate_limit: 16
+match_candidate_context: full
+match_validation: all

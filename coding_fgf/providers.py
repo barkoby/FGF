@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -69,7 +70,8 @@ class StructuredResult:
 
 def structured_generate(prompt: str, schema_name: str, model: str, *,
                         provider="openai", google_project="", google_location="",
-                        google_credentials="", temperature=None, event_logger=None) -> StructuredResult:
+                        google_credentials="", temperature=None, event_logger=None,
+                        output_schema=None) -> StructuredResult:
     retry_config()
     output_attempts = int(os.getenv("CODING_FGF_MODEL_OUTPUT_MAX_ATTEMPTS", "6"))
     if output_attempts <= 0:
@@ -88,6 +90,10 @@ def structured_generate(prompt: str, schema_name: str, model: str, *,
     from openai import OpenAI
     client = OpenAI(max_retries=0, timeout=float(os.getenv("CODING_FGF_OPENAI_TIMEOUT_SECONDS", "90")))
     kwargs = {"model": model, "input": prompt, "text": {"format": {"type": "json_object"}}}
+    if output_schema is not None:
+        name = re.sub(r"[^A-Za-z0-9_-]", "_", schema_name)[:64] or "response"
+        kwargs["text"]["format"] = {"type": "json_schema", "name": name,
+                                      "strict": True, "schema": output_schema}
     if temperature is not None:
         kwargs["temperature"] = temperature
     total_usage = {}
@@ -99,6 +105,15 @@ def structured_generate(prompt: str, schema_name: str, model: str, *,
             value = raw_usage.get(key) if isinstance(raw_usage, dict) else getattr(raw_usage, key, None)
             if isinstance(value, int):
                 total_usage[key] = total_usage.get(key, 0) + value
+        # A parseable fragment is not a completed model response.
+        if getattr(response, "status", None) in {"incomplete", "failed", "cancelled"}:
+            raise RuntimeError(f"Model response {response.status}")
+        for output in getattr(response, "output", []) or []:
+            content = output.get("content", []) if isinstance(output, dict) else getattr(output, "content", [])
+            for part in content or []:
+                kind = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+                if kind == "refusal":
+                    raise RuntimeError("Model response refusal")
         text = getattr(response, "output_text", "")
         try:
             if not text:
@@ -108,5 +123,5 @@ def structured_generate(prompt: str, schema_name: str, model: str, *,
             if attempt + 1 == output_attempts:
                 raise RuntimeError(f"Invalid JSON after {output_attempts} model-output attempts") from exc
             continue
-        return StructuredResult(data, model, total_usage, provider)
+        return StructuredResult(data, getattr(response, "model", model), total_usage, provider)
     raise RuntimeError("No structured response")

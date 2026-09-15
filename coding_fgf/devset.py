@@ -32,6 +32,8 @@ def select_dev_rows(
     fraction: float = 0.1,
     seed: str = "coding-fgf-dev10-v1",
 ) -> dict[str, list[dict[str, Optional[str]]]]:
+    if fraction == 1.0:
+        return {name: [dict(row) for row in data.rows.get(name, [])] for name in tables}
     selected: dict[str, set[tuple[Optional[str], ...]]] = {name: set() for name in tables}
     rows_by_key: dict[str, dict[tuple[Optional[str], ...], dict[str, Optional[str]]]] = {}
     rows_by_columns: dict[tuple[str, tuple[str, ...]], dict[tuple[Optional[str], ...], dict[str, Optional[str]]]] = {}

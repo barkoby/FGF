@@ -80,6 +80,10 @@ from .schema import find_ontology_file, parse_copy_data, parse_sql_dump
 
 
 def add_provider_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--retrieval-metric", choices=["legacy", "cosine"], default=None)
+    parser.add_argument("--match-candidate-limit", type=int, default=None)
+    parser.add_argument("--match-candidate-context", choices=["minimal", "full"], default=None)
+    parser.add_argument("--match-validation", choices=["suspicious", "all"], default=None)
     parser.add_argument("--llm-provider", choices=["openai", "google"], default=os.getenv("CODING_FGF_LLM_PROVIDER", "openai"))
     parser.add_argument("--llm-model", default=os.getenv("CODING_FGF_LLM_MODEL", ""))
     parser.add_argument("--embedding-provider", choices=["openai", "google"], default=os.getenv("CODING_FGF_EMBEDDING_PROVIDER", "openai"))
@@ -239,13 +243,16 @@ def _canonicalize_role_prefixed_target(value: Any) -> tuple[Any, bool]:
     return value, False
 
 
-def _canonicalize_fol_target_uris(fol: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _canonicalize_fol_target_uris(fol: dict[str, Any], matches=None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Remove accidental role prefixes from FOL target URI fields.
 
     The repair prompt sometimes returns values such as ``class:http://...`` in
     fields that should contain only the URI. This normalization is intentionally
     narrow and gold-blind: it only strips known syntactic role prefixes.
     """
+    if matches is not None:
+        from .fol import finalize_target_uris
+        return finalize_target_uris(fol, matches)
     out = copy.deepcopy(fol)
     rules = out.setdefault("rules", {})
     changes: list[dict[str, Any]] = []
@@ -536,7 +543,7 @@ def _run_attribute_coverage_stage(
                 tables,
                 allow_drop=True,
             )
-            candidate = validate_fol(candidate_raw, tables)
+            candidate = validate_fol(candidate_raw, tables, matches)
             candidate["generation"] = {
                 **fol.get("generation", {}),
                 "attribute_coverage_repair": repair_response.get("generation", {}),
@@ -682,8 +689,8 @@ def _run_fol_repair_round2(
     candidate_raw, action_counts = apply_round2_repairs(fol, list(response.get("repairs", []) or []), allow_drop=allow_drop)
     hygiene_report: dict[str, Any] = {}
     if preservation_gate:
-        candidate_raw, hygiene_report = _canonicalize_fol_target_uris(candidate_raw)
-    candidate = validate_fol(candidate_raw, tables)
+        candidate_raw, hygiene_report = _canonicalize_fol_target_uris(candidate_raw, matches)
+    candidate = validate_fol(candidate_raw, tables, matches)
     candidate["generation"] = {
         **fol.get("generation", {}),
         "repair_round2": response.get("generation", {}),
@@ -816,8 +823,8 @@ def _run_fol_single_round2_style_repair(
             )
             hygiene_report: dict[str, Any] = {}
             if preservation_gate:
-                candidate_raw, hygiene_report = _canonicalize_fol_target_uris(candidate_raw)
-            candidate = validate_fol(candidate_raw, tables)
+                candidate_raw, hygiene_report = _canonicalize_fol_target_uris(candidate_raw, matches)
+            candidate = validate_fol(candidate_raw, tables, matches)
             candidate["generation"] = {
                 **fol.get("generation", {}),
                 "repair_single_round2_style": response.get("generation", {}),
@@ -1080,8 +1087,8 @@ def _run_fol_standard_repair(
         )
         hygiene_report: dict[str, Any] = {}
         if preservation_gate:
-            repaired_raw, hygiene_report = _canonicalize_fol_target_uris(repaired_raw)
-        repaired = validate_fol(repaired_raw, tables)
+            repaired_raw, hygiene_report = _canonicalize_fol_target_uris(repaired_raw, matches)
+        repaired = validate_fol(repaired_raw, tables, matches)
         repaired["generation"] = {
             **fol.get("generation", {}),
             "repair": repaired_raw.get("generation", {}),
@@ -1152,8 +1159,8 @@ def _apply_fol_repair_arm(
         final_issues = list(issues)
         hygiene_report: dict[str, Any] = {}
         if preservation_gate:
-            final_fol, hygiene_report = _canonicalize_fol_target_uris(frozen_fol)
-            final_fol = validate_fol(final_fol, tables)
+            final_fol, hygiene_report = _canonicalize_fol_target_uris(frozen_fol, matches)
+            final_fol = validate_fol(final_fol, tables, matches)
             final_issues, _attribute_report = _all_fol_issues(
                 final_fol,
                 matches,
@@ -1686,7 +1693,7 @@ def stage_fol(
                 fol_batch_max_tokens=fol_batch_max_tokens,
                 fol_batch_overlap_strategy=fol_batch_overlap_strategy,
             )
-        fol = validate_fol(raw_fol, tables)
+        fol = validate_fol(raw_fol, tables, matches)
         fol["generation"] = raw_fol.get(
             "generation",
             {
@@ -1700,8 +1707,8 @@ def stage_fol(
         )
         initial_hygiene_report: dict[str, Any] = {}
         if fol_repair_preservation_gate:
-            fol, initial_hygiene_report = _canonicalize_fol_target_uris(fol)
-            fol = validate_fol(fol, tables)
+            fol, initial_hygiene_report = _canonicalize_fol_target_uris(fol, matches)
+            fol = validate_fol(fol, tables, matches)
             fol["generation"] = raw_fol.get("generation", fol.get("generation", {}))
         issues, attribute_report = _all_fol_issues(
             fol,
@@ -1799,8 +1806,8 @@ def stage_fol(
                 )
                 repair_report["attribute_coverage_stage"] = attribute_stage
             if fol_repair_preservation_gate:
-                fol, final_hygiene_report = _canonicalize_fol_target_uris(fol)
-                fol = validate_fol(fol, tables)
+                fol, final_hygiene_report = _canonicalize_fol_target_uris(fol, matches)
+                fol = validate_fol(fol, tables, matches)
                 final_issues, _final_attribute_report = _all_fol_issues(
                     fol,
                     matches,
@@ -1880,8 +1887,8 @@ def stage_fol(
                 if repaired_raw is not None:
                     hygiene_report: dict[str, Any] = {}
                     if fol_repair_preservation_gate:
-                        repaired_raw, hygiene_report = _canonicalize_fol_target_uris(repaired_raw)
-                    repaired = validate_fol(repaired_raw, tables)
+                        repaired_raw, hygiene_report = _canonicalize_fol_target_uris(repaired_raw, matches)
+                    repaired = validate_fol(repaired_raw, tables, matches)
                     repaired["generation"] = {
                         **fol.get("generation", {}),
                         "repair": repaired_raw.get("generation", {}),
@@ -1991,8 +1998,8 @@ def stage_fol(
             )
             repair_report["attribute_coverage_stage"] = attribute_stage
         if fol_repair_preservation_gate:
-            fol, final_hygiene_report = _canonicalize_fol_target_uris(fol)
-            fol = validate_fol(fol, tables)
+            fol, final_hygiene_report = _canonicalize_fol_target_uris(fol, matches)
+            fol = validate_fol(fol, tables, matches)
             final_issues, _final_attribute_report = _all_fol_issues(
                 fol,
                 matches,
@@ -2004,7 +2011,7 @@ def stage_fol(
             repair_report["issues_after"] = final_issues
         write_json(work / "fol_validation_report.json", repair_report)
     else:
-        fol = validate_fol(matches_to_fol(matches, tables), tables)
+        fol = validate_fol(matches_to_fol(matches, tables), tables, matches)
         fol["generation"] = {"source": "deterministic", "reason": "explicit offline or deterministic FOL mode"}
         if attribute_coverage_validation:
             fol, _attribute_stage = _run_attribute_coverage_stage(
@@ -2615,7 +2622,8 @@ def _generate_fol_portfolio_arm(
             fol_batch_max_tokens=int(getattr(args, "fol_batch_max_tokens", 0)),
             fol_batch_overlap_strategy=str(getattr(args, "fol_batch_overlap_strategy", "fk_neighbors")),
         )
-    fol = validate_fol(raw_fol, tables)
+    write_json(arm_work / "fol_rules_raw.json", raw_fol)
+    fol = validate_fol(raw_fol, tables, matches)
     fol["generation"] = raw_fol.get(
         "generation",
         {
@@ -2739,7 +2747,7 @@ def _invalid_triple_count_from_log(log: dict[str, Any]) -> int:
 
 def _role_prefixed_target_count(fol: dict[str, Any]) -> int:
     count = 0
-    for kind, target_key in (("class", "class_uri"), ("data", "property_uri"), ("object", "property_uri")):
+    for kind, target_key in (("class", "target_class"), ("data", "target_property"), ("object", "target_property")):
         for rule in (fol.get("rules", {}) or {}).get(kind, []) or []:
             value = str(rule.get(target_key, ""))
             if any(value.startswith(prefix) for prefix in _TARGET_ROLE_PREFIXES):
@@ -3795,7 +3803,7 @@ def _prepare_frozen_fol_input(
             fol_batch_max_tokens=int(getattr(args, "fol_batch_max_tokens", 0)),
             fol_batch_overlap_strategy=str(getattr(args, "fol_batch_overlap_strategy", "fk_neighbors")),
         )
-        fol = validate_fol(raw_fol, tables)
+        fol = validate_fol(raw_fol, tables, matches)
         fol["generation"] = raw_fol.get(
             "generation",
             {
@@ -3808,7 +3816,7 @@ def _prepare_frozen_fol_input(
             },
         )
     else:
-        fol = validate_fol(matches_to_fol(matches, tables), tables)
+        fol = validate_fol(matches_to_fol(matches, tables), tables, matches)
         fol["generation"] = {"source": "deterministic", "reason": "explicit offline mode"}
 
     issues, attribute_report = _all_fol_issues(
@@ -4675,5 +4683,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    args.func(args)
+    if getattr(args, "match_candidate_limit", None) is not None and args.match_candidate_limit <= 0:
+        raise SystemExit("--match-candidate-limit must be positive")
+    settings = {"retrieval_metric": ("CODING_FGF_RETRIEVAL_METRIC", "legacy"),
+                "match_candidate_limit": ("CODING_FGF_MATCH_CANDIDATE_LIMIT", "8"),
+                "match_candidate_context": ("CODING_FGF_MATCH_CANDIDATE_CONTEXT",
+                    "full" if os.getenv("CODING_FGF_MATCH_CANDIDATE_LIMIT") else "minimal"),
+                "match_validation": ("CODING_FGF_MATCH_VALIDATION", "suspicious")}
+    previous = {key: os.environ.get(key) for key, default in settings.values()}
+    try:
+        for attribute, (key, default) in settings.items():
+            supplied = getattr(args, attribute, None)
+            value = str(supplied) if supplied is not None else os.getenv(key, default)
+            os.environ[key] = value
+            if hasattr(args, attribute):
+                setattr(args, attribute, int(value) if attribute == "match_candidate_limit" else value)
+        args.func(args)
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 

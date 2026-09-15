@@ -32,7 +32,7 @@ The pipeline converts relational and ontology structures into textual records us
 
 ### 3. Candidate Generation
 
-Candidate generation embeds source and target verbalizations with the selected embedding provider. The current architecture supports both OpenAI and Google Vertex embedding models. Embeddings are cached by provider, model, and text-derived keys. Pipeline retrieval ranks squared L2 distance with a lexical-overlap bonus, filters by source kind, and skips class retrieval for join tables. The default k is 16. Candidate ablations separately compare dense cosine similarity, lexical methods, and reciprocal-rank fusion.
+Candidate generation embeds source and target verbalizations with the selected embedding provider. The current architecture supports both OpenAI and Google Vertex embedding models. Embedding cache keys include provider, model, execution mode, text, and verbalization version. Pipeline retrieval supports squared L2 distance with a lexical-overlap bonus (`legacy`) and normalized cosine similarity (`cosine`). Both filter by source kind and skip class retrieval for join tables. The public configuration retrieves 16 candidates; `match_candidate_limit` separately controls how many detailed candidates reach matching. Candidate ablations separately compare dense cosine similarity, lexical methods, and reciprocal-rank fusion.
 
 Candidate outputs are saved as diagnostic artifacts. Candidate metrics can be evaluated separately when gold target alignments are available, but final pipeline scoring is still based on generated RDF and query-pair evaluation.
 
@@ -40,13 +40,13 @@ Candidate outputs are saved as diagnostic artifacts. Candidate metrics can be ev
 
 The matching stage asks the configured LLM to select the best target candidate, or no match, for each source element. The prompt receives source context, target candidate context, source kind, target kind, schema evidence, and table/column information. The selected match must refer to a supplied candidate URI rather than inventing a target.
 
-After the initial LLM decision, the pipeline applies generic validation. Validation checks include candidate membership, source/target kind compatibility, suspicious identifier mappings, foreign-key datatype mismatches, and domain/range consistency where available. When enabled by the current pipeline mode, suspicious LLM outputs may be re-asked using the same provider and model. Invalid live outputs are recorded rather than silently converted into deterministic target substitutions.
+After the initial LLM decision, the pipeline applies generic validation. Validation checks include candidate membership, source/target kind compatibility, suspicious identifier mappings, foreign-key datatype mismatches, and domain/range consistency where available. OpenAI matching uses a request-specific strict JSON schema, and both providers undergo the same identifier and confidence checks. Invalid responses receive bounded corrective feedback. `match_validation` controls whether semantic review covers suspicious decisions or all decisions. Exhausted structural failures raise or are explicitly recorded according to the matching mode; valid null decisions remain abstentions. Lexical domain-name and foreign-key heuristics remain visible as semantic warnings after review, because source renaming can trigger them for valid mappings. They do not independently abort a run.
 
 ### 5. FOL Rule Generation
 
 Accepted matches are converted into FOL-style mapping rules using the configured LLM. The rules describe how source tables, columns, values, and relationships should produce target RDF classes, datatype assertions, and object-property assertions. Rule records keep provenance back to the originating match identifiers.
 
-The FOL stage validates generated rules against schema and ontology evidence. It checks table and column references, target URI provenance, rule kind, row filters, foreign-key direction, and object-link plans where available. A repair prompt may be used to correct invalid rules, but repair decisions are based only on internal schema, match, FOL, and diagnostic evidence. The system does not use qpair failures, SQL answers, SPARQL answers, or paper baseline scores to accept or reject rules.
+The FOL stage first resolves internal target identifiers only when an accepted match of the same kind unambiguously supplies the target URI. It then validates generated rules against schema and ontology evidence. It checks table and column references, target URI provenance, rule kind, row filters, foreign-key direction, and object-link plans where available. A repair prompt may be used to correct invalid rules, but repair decisions are based only on internal schema, match, FOL, and diagnostic evidence. The system does not use qpair failures, SQL answers, SPARQL answers, or paper baseline scores to accept or reject rules.
 
 ### 6. Python FGF Code Generation
 
@@ -108,7 +108,7 @@ Each scenario run produces a structured set of artifacts:
 - generated Python FGF code and candidate-code scores;
 - materialized RDF output and materialization logs;
 - SQL-vs-SPARQL evaluation summaries;
-- comparison reports against benchmark reference tables;
+- comparison reports using supplied baselines, with absent reference fields left empty;
 - diagnostic files for hard cases, suspicious mappings, and stage-level failures.
 
 These artifacts make it possible to analyze candidate retrieval, matching, rule quality, code generation, and RDF materialization separately while preserving one final end-to-end evaluation path.

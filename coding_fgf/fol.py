@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import copy
 
 from .lexical import words
 from .schema import Table, foreign_key_columns, is_generic_identifier_column, table_key, table_role
@@ -8,6 +9,48 @@ from .schema import Table, foreign_key_columns, is_generic_identifier_column, ta
 
 _SEMANTIC_ID_WORDS = {"paperid", "paper_id", "doi", "url", "email", "isbn", "issn", "code", "abbrev", "abbreviation"}
 _SEMANTIC_ID_TARGET_WORDS = {"code", "car", "abbrev", "abbreviation", "doi", "url", "email", "isbn", "issn"}
+
+TARGET_FIELDS = {"class": "target_class", "data": "target_property", "object": "target_property"}
+TARGET_ROLE_KINDS = {"class": "class", "data_property": "data", "datatype_property": "data", "object_property": "object"}
+
+
+def finalize_target_uris(fol, matches):
+    """Resolve exact internal target IDs using accepted, same-kind evidence only."""
+    out = copy.deepcopy(fol)
+    accepted = {kind: set() for kind in TARGET_FIELDS}
+    identifiers = {}
+    for match in matches:
+        uri = match.get("target_uri")
+        if not isinstance(uri, str) or not _is_valid_target_uri(uri):
+            continue
+        source_id = str(match.get("source_id", ""))
+        kind = TARGET_ROLE_KINDS.get(match.get("target_kind"))
+        if kind is None:
+            kind = next((k for p, k in (("source-class:", "class"), ("source-discriminator:", "class"),
+                       ("source-data:", "data"), ("source-object:", "object")) if source_id.startswith(p)), None)
+        if kind is None:
+            continue
+        accepted[kind].add(uri)
+        if match.get("target_id"):
+            identifiers.setdefault(str(match["target_id"]), set()).add((kind, uri))
+    changes = []
+    for kind, field in TARGET_FIELDS.items():
+        for index, rule in enumerate(out.get("rules", {}).get(kind, []) or []):
+            old = rule.get(field)
+            if not isinstance(old, str):
+                continue
+            prefix, separator, remainder = old.partition(":")
+            if not separator or TARGET_ROLE_KINDS.get(prefix) != kind:
+                continue
+            possibilities = identifiers.get(old, {(kind, remainder)} if remainder in accepted[kind] else set())
+            if len(possibilities) != 1:
+                continue
+            resolved_kind, uri = next(iter(possibilities))
+            if resolved_kind != kind or uri not in accepted[kind]:
+                continue
+            rule[field] = uri
+            changes.append({"rule_id": f"{kind}:{index}", "field": field, "old": old, "new": uri})
+    return out, {"canonicalized_target_uri_count": len(changes), "canonicalized_target_uris": changes}
 
 
 def _is_valid_target_uri(uri: str) -> bool:
@@ -486,7 +529,10 @@ def _infer_ref_table(column: str, tables: dict[str, Table]) -> str | None:
     return None
 
 
-def validate_fol(fol: dict[str, Any], tables: dict[str, Table]) -> dict[str, Any]:
+def validate_fol(fol: dict[str, Any], tables: dict[str, Table], matches=None) -> dict[str, Any]:
+    report = None
+    if matches is not None:
+        fol, report = finalize_target_uris(fol, matches)
     valid = {"class": [], "data": [], "object": []}
     for rule in fol.get("rules", {}).get("class", []):
         table = rule.get("source_table")
@@ -502,7 +548,14 @@ def validate_fol(fol: dict[str, Any], tables: dict[str, Table]) -> dict[str, Any
         target = rule.get("target_table")
         if table in tables and target in tables and rule.get("target_property"):
             valid["object"].append(rule)
-    return {"rules": valid}
+    result = {"rules": valid}
+    if report is not None:
+        # Keep earlier normalization evidence when a repair validates the rules again.
+        earlier = fol.get("target_uri_normalization", {}).get("canonicalized_target_uris", [])
+        report["canonicalized_target_uris"] = earlier + report["canonicalized_target_uris"]
+        report["canonicalized_target_uri_count"] = len(report["canonicalized_target_uris"])
+        result["target_uri_normalization"] = report
+    return result
 
 
 def _rule_targets(rule: dict[str, Any], kind: str) -> list[str]:

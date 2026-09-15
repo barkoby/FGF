@@ -42,7 +42,7 @@ Class rules map source tables or discriminator-filtered rows to target classes. 
 
 ## Validation as Grounding
 
-Validation grounds the generated FOL rules in the available schema and selected matches. The validator first normalizes the LLM output into the expected rule groups and discards rules that do not reference known tables, columns, or targets at the basic structural level. It then reports detailed validation issues that are used for repair and acceptance decisions.
+Validation grounds the generated FOL rules in the available schema and selected matches. Before structural checks, an internal target identifier such as `class:urn:example:Entity` can become `urn:example:Entity` only if accepted matches establish that same class target unambiguously. Unknown identifiers and cross-kind substitutions remain invalid. This finalization is shared by the portfolio arms and repair paths; it does not invent semantic mappings. The validator first normalizes the LLM output into the expected rule groups and discards rules that do not reference known tables, columns, or targets at the basic structural level. It then reports detailed validation issues that are used for repair and acceptance decisions.
 
 The validation checks include:
 

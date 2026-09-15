@@ -17,3 +17,9 @@ __pycache__
 .ipynb_checkpoints
 pytest_tmp
 tests/_work
+
+# Local provider credentials
+application_default_credentials.json
+*service-account*.json
+*.key
+*.pem

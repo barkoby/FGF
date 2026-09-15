@@ -10,8 +10,10 @@ For the default work directory `/outputs/openai_best_fol_default`:
 - `runs/<scenario>/eval/metrics_details.json`: query-level answers and scores.
 - `runs/<scenario>/eval/summary.csv`: scenario averages.
 - `runs/<scenario>/fol_portfolio_selection_report.json`: internal selection evidence.
+- `runs/<scenario>/fol_portfolio/<arm>/fol_rules_raw.json`: original generated rules before grounded target-identifier normalization.
+- The normalized FOL retains a report of changed target fields and their original values.
 - `runs/<scenario>/fol_ablation/fol_selection_comparison.csv`: optional frozen-arm comparison.
-- `comparison/`: stored reference-table comparisons.
+- `comparison/`: comparison reports; reference fields are empty when no reference is supplied.
 - `run_metadata.json`: configuration and scenario status.
 
 Ablations use `ablations/<ablation-name>` beneath the config's work directory. FOL ablations retain the same nested `runs/<scenario>` structure.
