@@ -96,7 +96,7 @@ OpenAI matching uses a request-specific strict JSON schema. Every provider respo
 
 Embedding cache version 2 separates provider, model, live/offline mode, and verbalization version. Legacy entries remain on disk but are not reused automatically; the next live run may make new embedding requests.
 
-Generated code is AST-validated and runs in a separate worker. Defaults are 120 seconds and 2048 MiB of worker address space, controlled by `CODING_FGF_SANDBOX_TIMEOUT_SECONDS` and `CODING_FGF_SANDBOX_MEMORY_MB`. Limit failures reject the candidate without partial RDF. These controls are not a general-purpose hostile-code isolation system.
+Generated code is AST-validated and runs in a separate worker. Defaults are 120 seconds and 2048 MiB of worker address space, controlled by `CODING_FGF_SANDBOX_TIMEOUT_SECONDS` and `CODING_FGF_SANDBOX_MEMORY_MB`. Limit failures reject the candidate without partial RDF.
 
 ## Tests
 
